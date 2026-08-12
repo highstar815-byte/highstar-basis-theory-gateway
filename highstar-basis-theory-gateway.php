@@ -55,7 +55,7 @@ function hsbt_init_gateway() {
             $this->supports           = array('products');
 
             // Hardcoded values requested by client.
-            $this->highstar_api_url     = 'https://highstarpayments.com/api/payments/create';
+            $this->highstar_api_url     = 'https://staging.highstarpayments.com/api/payments/create';
             $this->bt_environment       = 'us';
 
             $this->init_form_fields();
