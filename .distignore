@@ -1,0 +1,21 @@
+# Paths that must NOT ship inside the distributed plugin ZIP.
+# Consumed by the release workflow via: rsync --exclude-from=.distignore
+#
+# Note: the vendored Plugin Update Checker at lib/plugin-update-checker/ IS
+# shipped (it is required at runtime); only dev/meta files are excluded here.
+
+.git
+.github
+.claude
+build
+node_modules
+tests
+.gitignore
+.distignore
+composer.json
+composer.lock
+package.json
+package-lock.json
+README.md
+*.log
+*.zip

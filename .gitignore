@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+*.zip
+
+# JS dependencies
+node_modules/
+
+# Project-root Composer dependencies only. Root-anchored on purpose so it never
+# matches the vendored library at lib/plugin-update-checker/vendor/, which MUST
+# stay tracked in git (PUC loads it at runtime).
+/vendor/
+
+# Logs
+*.log
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Lint against the plugin's actual target so 8.x-only syntax can't slip in.
+      - name: Set up PHP 7.4 (matches the plugin target)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'
+          tools: none
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"        # strip the leading "v"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing tag '$TAG' -> version '$VERSION'"
+
+      - name: Verify plugin header version matches the tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          HEADER_VERSION="$(grep -iE '^[[:space:]]*\*?[[:space:]]*Version:' highstar-basis-theory-gateway.php \
+            | head -n1 | sed -E 's/.*[Vv]ersion:[[:space:]]*//' | tr -d '[:space:]')"
+          echo "Plugin header Version: '$HEADER_VERSION'  (tag version: '$VERSION')"
+          if [ "$HEADER_VERSION" != "$VERSION" ]; then
+            echo "::error::Plugin header Version ($HEADER_VERSION) does not match tag ($VERSION)."
+            exit 1
+          fi
+
+      - name: Verify readme Stable tag matches the tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          README_VERSION="$(grep -iE '^[[:space:]]*Stable tag:' readme.txt \
+            | head -n1 | sed -E 's/.*[Ss]table tag:[[:space:]]*//' | tr -d '[:space:]')"
+          echo "readme.txt Stable tag: '$README_VERSION'  (tag version: '$VERSION')"
+          if [ "$README_VERSION" != "$VERSION" ]; then
+            echo "::error::readme.txt Stable tag ($README_VERSION) does not match tag ($VERSION)."
+            exit 1
+          fi
+
+      - name: Verify the Plugin Update Checker library is vendored
+        run: |
+          set -euo pipefail
+          if [ ! -f lib/plugin-update-checker/plugin-update-checker.php ]; then
+            echo "::error::lib/plugin-update-checker/plugin-update-checker.php is missing. Vendor PUC before tagging."
+            exit 1
+          fi
+          echo "PUC library present."
+
+      - name: Lint all plugin PHP (excluding lib/)
+        run: |
+          set -euo pipefail
+          find . -name '*.php' -not -path './lib/*' -print0 \
+            | xargs -0 -n1 -P1 php -l
+          echo "PHP lint passed."
+
+      - name: Build distributable ZIP
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/highstar-basis-theory-gateway
+          # Copy the tree into a correctly named top-level folder, dropping
+          # everything listed in .distignore.
+          rsync -a --exclude-from=.distignore ./ build/highstar-basis-theory-gateway/
+          ( cd build && zip -r ../highstar-basis-theory-gateway.zip highstar-basis-theory-gateway >/dev/null )
+          echo "Built highstar-basis-theory-gateway.zip"
+
+      - name: Show ZIP contents
+        run: unzip -l highstar-basis-theory-gateway.zip
+
+      - name: Create GitHub Release and attach ZIP
+        uses: softprops/action-gh-release@v2
+        with:
+          files: highstar-basis-theory-gateway.zip
+          generate_release_notes: true
