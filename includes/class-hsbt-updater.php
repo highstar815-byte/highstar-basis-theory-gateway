@@ -40,7 +40,7 @@ if (!class_exists('HSBT_Updater')) {
     class HSBT_Updater {
 
         /** GitHub repository that hosts the tagged releases. */
-        const REPO_URL = 'https://github.com/highstarpayments/highstar-basis-theory-gateway';
+        const REPO_URL = 'https://github.com/highstar815-byte/highstar-basis-theory-gateway';
 
         /** Plugin slug. MUST match the installed plugin folder name. */
         const SLUG = 'highstar-basis-theory-gateway';
