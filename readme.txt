@@ -26,7 +26,7 @@ Updates are delivered straight from GitHub Releases, so merchants get the normal
 1. Upload the `highstar-basis-theory-gateway` folder to `/wp-content/plugins/`.
 2. Activate the plugin through the "Plugins" menu in WordPress.
 3. Go to WooCommerce > Settings > Payments > High Star Payments and enter your
-   Public API Key, Private/Proxy Key, and Account ID.
+   Public API Key, Private/Proxy Key, and Account ID.  
 
 == Frequently Asked Questions ==
 
