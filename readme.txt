@@ -5,7 +5,7 @@ Requires at least: 6.0
 Tested up to: 6.6
 Requires PHP: 7.4
 WC requires at least: 7.0
-Stable tag: 0.2.7
+Stable tag: 0.2.8
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -44,6 +44,10 @@ token is only needed for a private repository, and it would ship to every store
 in plain text - which is why it is left empty by default.
 
 == Changelog ==
+
+= 0.2.8 =
+* Added a small version label next to the gateway title on the WooCommerce
+  settings page (display-only; no change to checkout or payment handling).
 
 = 0.2.7 =
 * Added automatic updates via GitHub Releases (Plugin Update Checker), so
