@@ -2,7 +2,7 @@
 /**
  * Plugin Name: High Star Payment Gateway
  * Description: WooCommerce custom payment gateway using Secure payment gateway configuration.
- * Version: 0.2.7
+ * Version: 0.2.8
  * Author: High Star Payments
  * Requires at least: 6.0
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
  * Plugin constants. Each guarded with defined() so a double-load cannot fatal.
  */
 if (!defined('HSBT_VERSION')) {
-    define('HSBT_VERSION', '0.2.7');
+    define('HSBT_VERSION', '0.2.8');
 }
 if (!defined('HSBT_PLUGIN_FILE')) {
     define('HSBT_PLUGIN_FILE', __FILE__);
@@ -75,6 +75,24 @@ function hsbt_init_gateway() {
             );
 
             add_action('wp_enqueue_scripts', array($this, 'enqueue_scripts'));
+        }
+
+        /**
+         * Render the settings page. Adds a small version label next to the
+         * gateway title. Display-only: no payment/tokenization logic here.
+         */
+        public function admin_options() {
+            echo '<h2>' . esc_html($this->method_title);
+            echo ' <span style="font-size:12px;color:#666;font-weight:normal;">v' . esc_html(HSBT_VERSION) . '</span>';
+            echo '</h2>';
+
+            if ($this->method_description) {
+                echo '<p>' . esc_html($this->method_description) . '</p>';
+            }
+
+            echo '<table class="form-table">';
+            $this->generate_settings_html();
+            echo '</table>';
         }
 
         public function init_form_fields() {
