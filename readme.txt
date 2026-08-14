@@ -5,7 +5,7 @@ Requires at least: 6.0
 Tested up to: 6.6
 Requires PHP: 7.4
 WC requires at least: 7.0
-Stable tag: 0.2.8
+Stable tag: 0.3.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -44,6 +44,25 @@ token is only needed for a private repository, and it would ship to every store
 in plain text - which is why it is left empty by default.
 
 == Changelog ==
+
+= 0.3.1 =
+* Added a fresh per-submit idempotency nonce to checkout. Each deliberate "Place
+  Order" click generates a new nonce (crypto.randomUUID with a safe fallback)
+  that is sent to the backend, so an accidental network/AJAX retransmission of
+  the same submission is safely deduplicated (no double charge) while a genuine
+  retry after a decline is processed as a new payment attempt. Fixes the Stripe
+  "same key, different parameters" idempotency error on retries.
+
+= 0.3.0 =
+* Added shopper IP capture: the plugin now resolves the real customer IP at the
+  WordPress edge (Cloudflare / proxy headers, falling back to REMOTE_ADDR) and
+  forwards it with the payment so it appears on the transaction record.
+* Added a full order-details snapshot (products, per-unit prices, quantities,
+  variations, totals, tax, shipping, coupons, and fees) sent with each payment so
+  the complete order shows in the High Star transaction details.
+* Added a Plugin Monitoring health endpoint at /wp-json/highstar/v1/health that
+  reports the plugin, WooCommerce, WordPress, and PHP status so the High Star
+  backend can monitor each store. Read-only and exposes no keys or customer data.
 
 = 0.2.8 =
 * Added a small version label next to the gateway title on the WooCommerce

@@ -2,12 +2,12 @@
 /**
  * Plugin Name: High Star Payment Gateway
  * Description: WooCommerce custom payment gateway using Secure payment gateway configuration.
- * Version: 0.2.8
+ * Version: 0.3.1
  * Author: High Star Payments
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * WC requires at least: 7.0
- * Update URI: https://github.com/highstarpayments/highstar-basis-theory-gateway
+ * Update URI: https://github.com/highstar815-byte/highstar-basis-theory-gateway
  */
 
 if (!defined('ABSPATH')) {
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
  * Plugin constants. Each guarded with defined() so a double-load cannot fatal.
  */
 if (!defined('HSBT_VERSION')) {
-    define('HSBT_VERSION', '0.2.8');
+    define('HSBT_VERSION', '0.3.1');
 }
 if (!defined('HSBT_PLUGIN_FILE')) {
     define('HSBT_PLUGIN_FILE', __FILE__);
@@ -36,6 +36,16 @@ if (!defined('HSBT_PLUGIN_URL')) {
  */
 if (file_exists(HSBT_PLUGIN_DIR . 'includes/class-hsbt-updater.php')) {
     require_once HSBT_PLUGIN_DIR . 'includes/class-hsbt-updater.php';
+}
+
+/**
+ * Plugin Monitoring health endpoint (/wp-json/highstar/v1/health). Loaded at the
+ * top level — independent of WooCommerce — so the High Star monitoring backend
+ * can reach it even when WooCommerce is inactive. Guarded so a missing file can
+ * never break the plugin.
+ */
+if (file_exists(HSBT_PLUGIN_DIR . 'includes/class-hsbt-health.php')) {
+    require_once HSBT_PLUGIN_DIR . 'includes/class-hsbt-health.php';
 }
 
 add_action('plugins_loaded', 'hsbt_init_gateway');
@@ -147,6 +157,10 @@ function hsbt_init_gateway() {
             echo '</div>';
 
             echo '<input type="hidden" name="hsbt_token_intent_id" id="hsbt_token_intent_id" value="">';
+            // Fresh per-submit idempotency nonce set by bt-checkout.js. Lets the
+            // backend deduplicate an accidental retransmission of the same submit
+            // while treating a deliberate retry as a new payment attempt.
+            echo '<input type="hidden" name="hsbt_payment_nonce" id="hsbt_payment_nonce" value="">';
             echo '<div id="hsbt-card-error" style="color:red;margin-top:8px;font-size:14px;"></div>';
         }
 
@@ -302,6 +316,196 @@ function hsbt_init_gateway() {
             return $items;
         }
 
+        /**
+         * Best-effort resolution of the real shopper IP at the WordPress edge.
+         *
+         * The backend receives payments server-to-server (wp_remote_post), so the
+         * connecting peer it sees is this WordPress/VPS host, not the buyer. The
+         * shopper's true IP is only knowable here, so we resolve it and forward it
+         * in the payload. Order matters: trusted edge/proxy headers first, then the
+         * left-most X-Forwarded-For entry, then the raw REMOTE_ADDR fallback. Only a
+         * well-formed, public (non-private/loopback) address is returned; the
+         * backend also re-validates, so a bad value simply falls back there.
+         *
+         * @return string Resolved public IP, or '' when none could be determined.
+         */
+        private function get_client_ip() {
+            $headers = array(
+                'HTTP_CF_CONNECTING_IP', // Cloudflare
+                'HTTP_TRUE_CLIENT_IP',   // Akamai / Cloudflare Enterprise
+                'HTTP_X_REAL_IP',        // common reverse-proxy header
+                'HTTP_X_FORWARDED_FOR',  // may be a comma-separated chain
+                'REMOTE_ADDR',           // direct connection fallback
+            );
+
+            foreach ($headers as $header) {
+                if (empty($_SERVER[$header])) {
+                    continue;
+                }
+
+                $raw = wp_unslash($_SERVER[$header]);
+
+                // X-Forwarded-For can be "client, proxy1, proxy2" — scan left→right
+                // for the first public candidate.
+                foreach (explode(',', $raw) as $candidate) {
+                    $ip = $this->normalize_ip_candidate($candidate);
+                    if ($ip !== '' && $this->is_public_ip($ip)) {
+                        return $ip;
+                    }
+                }
+            }
+
+            return '';
+        }
+
+        /** Strip a port / IPv6 brackets / zone index and validate the IP format. */
+        private function normalize_ip_candidate($value) {
+            $ip = trim((string) $value);
+            if ($ip === '') {
+                return '';
+            }
+
+            // "[2001:db8::1]:443" -> "2001:db8::1"
+            if (strpos($ip, '[') === 0) {
+                $close = strpos($ip, ']');
+                if ($close !== false) {
+                    $ip = substr($ip, 1, $close - 1);
+                }
+            } elseif (substr_count($ip, ':') === 1 && filter_var(explode(':', $ip)[0], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                // "203.0.113.5:54321" -> "203.0.113.5"
+                $ip = substr($ip, 0, strrpos($ip, ':'));
+            }
+
+            $ip = preg_replace('/%.*$/', '', $ip); // drop IPv6 zone index (fe80::1%eth0)
+
+            // IPv4-mapped IPv6 (::ffff:203.0.113.5) -> 203.0.113.5
+            if (preg_match('/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i', $ip, $m)) {
+                $ip = $m[1];
+            }
+
+            return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
+        }
+
+        /** A routable public address (rejects private / loopback / link-local / CGNAT). */
+        private function is_public_ip($ip) {
+            return (bool) filter_var(
+                $ip,
+                FILTER_VALIDATE_IP,
+                FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+            );
+        }
+
+        /** First product-category names for an ordered product (for order details). */
+        private function get_product_category_names($product) {
+            if (!$product) {
+                return '';
+            }
+
+            // Variations carry no categories of their own — read the parent's.
+            $category_source_id = $product->is_type('variation')
+                ? $product->get_parent_id()
+                : $product->get_id();
+
+            $terms = get_the_terms($category_source_id, 'product_cat');
+
+            if (empty($terms) || is_wp_error($terms)) {
+                return '';
+            }
+
+            $names = wp_list_pluck($terms, 'name');
+
+            return $this->clean_meta_value(implode(', ', $names), 200);
+        }
+
+        /** Variation/custom attributes for an order line item as name/value pairs. */
+        private function get_item_attributes_payload($item) {
+            $attributes = array();
+
+            if (!method_exists($item, 'get_formatted_meta_data')) {
+                return $attributes;
+            }
+
+            // Default args hide `_`-prefixed internal meta, so only customer-facing
+            // attributes (e.g. variation options) are captured.
+            foreach ($item->get_formatted_meta_data() as $meta) {
+                $name  = isset($meta->display_key) ? $this->clean_meta_value($meta->display_key, 120) : '';
+                $value = isset($meta->display_value) ? $this->clean_meta_value($meta->display_value, 300) : '';
+
+                if ($name === '' && $value === '') {
+                    continue;
+                }
+
+                $attributes[] = array(
+                    'name'  => $name,
+                    'value' => $value,
+                );
+            }
+
+            return $attributes;
+        }
+
+        /**
+         * WooCommerce order snapshot (products, per-unit prices, totals, tax,
+         * shipping, coupons, fees) in MAJOR units. Internal/admin-only: the backend
+         * stores it on the payment attempt for the Transaction detail view and the
+         * price-mismatch review — it is never forwarded to Stripe and never affects
+         * the charge (which uses the top-level cents `amount`).
+         */
+        private function get_order_details_payload($order) {
+            $items = array();
+
+            foreach ($order->get_items() as $item) {
+                $product = $item->get_product();
+
+                $items[] = array(
+                    'name'         => $this->clean_meta_value($item->get_name(), 300),
+                    // Parent product id (variation id is reported separately below).
+                    'product_id'   => $item->get_product_id() ? (string) $item->get_product_id() : '',
+                    'variation_id' => $item->get_variation_id() ? (string) $item->get_variation_id() : '',
+                    'sku'          => $product ? $this->clean_meta_value($product->get_sku(), 120) : '',
+                    'category'     => $this->get_product_category_names($product),
+                    'quantity'     => (int) $item->get_quantity(),
+                    // Per-unit listed price (ex-tax, pre-discount) — this is the
+                    // "product price" the price-review compares to saved points.
+                    'unit_price'   => (float) $order->get_item_subtotal($item, false, false),
+                    'subtotal'     => (float) $order->get_line_subtotal($item, false, false),
+                    'total'        => (float) $order->get_line_total($item, false, false),
+                    'tax'          => (float) $order->get_line_tax($item),
+                    'attributes'   => $this->get_item_attributes_payload($item),
+                );
+            }
+
+            $coupons = array();
+            foreach ($order->get_coupon_codes() as $code) {
+                $clean = $this->clean_meta_value($code, 120);
+                if ($clean !== '') {
+                    $coupons[] = $clean;
+                }
+            }
+
+            $fees = array();
+            foreach ($order->get_fees() as $fee) {
+                $fees[] = array(
+                    'name'  => $this->clean_meta_value($fee->get_name(), 200),
+                    'total' => (float) $fee->get_total(),
+                );
+            }
+
+            return array(
+                'currency'        => $order->get_currency(),
+                'subtotal'        => (float) $order->get_subtotal(),
+                'discount_total'  => (float) $order->get_total_discount(),
+                'shipping_total'  => (float) $order->get_shipping_total(),
+                'shipping_tax'    => (float) $order->get_shipping_tax(),
+                'tax_total'       => (float) $order->get_total_tax(),
+                'total'           => (float) $order->get_total(),
+                'shipping_method' => $this->clean_meta_value($order->get_shipping_method(), 200),
+                'coupons'         => $coupons,
+                'fees'            => $fees,
+                'items'           => $items,
+            );
+        }
+
         private function call_highstar_backend($payload, $order) {
             $api_url = esc_url_raw($this->highstar_api_url);
 
@@ -360,13 +564,19 @@ function hsbt_init_gateway() {
             }
 
             $token_intent_id = isset($_POST['hsbt_token_intent_id'])
-                ? sanitize_text_field($_POST['hsbt_token_intent_id'])
+                ? sanitize_text_field(wp_unslash($_POST['hsbt_token_intent_id']))
                 : '';
 
             if (empty($token_intent_id)) {
                 wc_add_notice('Card tokenization failed. Please try again.', 'error');
                 return array('result' => 'failure');
             }
+
+            // Fresh per-submit idempotency nonce (see bt-checkout.js). The backend
+            // uses it as the stable seed for its Stripe idempotency keys.
+            $payment_nonce = isset($_POST['hsbt_payment_nonce'])
+                ? sanitize_text_field(wp_unslash($_POST['hsbt_payment_nonce']))
+                : '';
 
             if (
                 empty($this->bt_private_key) ||
@@ -383,6 +593,7 @@ function hsbt_init_gateway() {
             $shipping_name   = $this->get_shipping_name($order);
             $billing_address = $this->get_plain_billing_address($order);
             $shipping_addr   = $this->get_plain_shipping_address($order);
+            $client_ip       = $this->get_client_ip();
 
             $payload = array(
                 'account_id'        => $this->connected_account_id,
@@ -394,6 +605,12 @@ function hsbt_init_gateway() {
                 'order_id'    => (string) $order_id,
                 'order_key'   => $order->get_order_key(),
                 'order_total' => (string) $order->get_total(),
+
+                // Real shopper IP resolved at the WordPress edge. The backend
+                // reads client_ip/ip_address for the transaction audit trail
+                // (server-to-server calls can't see the buyer's IP otherwise).
+                'client_ip'   => $client_ip,
+                'ip_address'  => $client_ip,
 
                 'customer_data' => array(
                     'id'    => (string) $order->get_customer_id(),
@@ -443,6 +660,18 @@ function hsbt_init_gateway() {
                 ),
 
                 'line_items' => $this->get_line_items_payload($order),
+
+                // Full order snapshot (per-unit prices, totals, tax, shipping,
+                // coupons, fees) for the backend Transaction detail view and the
+                // price-mismatch review. Internal only — never sent on to Stripe.
+                'order_details' => $this->get_order_details_payload($order),
+
+                // Fresh per-submit nonce — the backend's preferred idempotency seed.
+                'payment_nonce' => $payment_nonce,
+
+                // Legacy order-level key. Kept for backward compatibility only; the
+                // backend no longer seeds Stripe idempotency from it (it is constant
+                // for the whole order and caused "same key, different parameters").
                 'idempotency_key' => 'woo_' . $order_id . '_' . $order->get_order_key(),
             );
 

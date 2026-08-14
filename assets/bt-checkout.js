@@ -21,6 +21,67 @@
     $("#hsbt-card-error").text(message || "");
   }
 
+  /**
+   * Fresh per-submit idempotency nonce. Generated for each deliberate "Place
+   * Order" click that produces a fresh tokenization, so the backend can tell an
+   * accidental retransmission of the SAME submission (same nonce → Stripe safely
+   * deduplicates) apart from a deliberate retry (new click → new token → new
+   * nonce → processed as a new attempt). Carries no card data — just a random id.
+   */
+  function generateNonce() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+      if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        // RFC 4122 v4 layout.
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = Array.prototype.map
+          .call(bytes, function (b) {
+            return ("0" + b.toString(16)).slice(-2);
+          })
+          .join("");
+        return (
+          hex.slice(0, 8) +
+          "-" +
+          hex.slice(8, 12) +
+          "-" +
+          hex.slice(12, 16) +
+          "-" +
+          hex.slice(16, 20) +
+          "-" +
+          hex.slice(20)
+        );
+      }
+    } catch (e) {
+      // Fall through to the non-crypto fallback below.
+    }
+    // Last-resort fallback for very old browsers without Web Crypto.
+    return (
+      "hsbt-" +
+      Date.now().toString(16) +
+      "-" +
+      Math.random().toString(16).slice(2) +
+      Math.random().toString(16).slice(2)
+    );
+  }
+
+  // Write a brand-new nonce (called when a fresh token intent is created).
+  function setPaymentNonce() {
+    $("#hsbt_payment_nonce").val(generateNonce());
+  }
+
+  // Guarantee a nonce exists without replacing an already-set one (so a
+  // retransmitted submission keeps the same value).
+  function ensurePaymentNonce() {
+    if (!$("#hsbt_payment_nonce").val()) {
+      setPaymentNonce();
+    }
+  }
+
   function getSelectedPaymentMethod() {
     return $('input[name="payment_method"]:checked').val();
   }
@@ -208,6 +269,10 @@
     }
 
     $("#hsbt_token_intent_id").val(tokenIntent.id);
+    // A fresh tokenization is a fresh deliberate submission → new idempotency
+    // nonce. A network/AJAX retransmission of the same submit does not re-run
+    // this, so the nonce stays stable for that identical request.
+    setPaymentNonce();
     return tokenIntent.id;
   }
 
@@ -225,6 +290,9 @@
     }
 
     if ($("#hsbt_token_intent_id").val()) {
+      // Token already created for this submission — make sure it carries a nonce
+      // (it normally does, set when the token was created) before it submits.
+      ensurePaymentNonce();
       return true;
     }
 
