@@ -16,6 +16,9 @@
   let isReady = false;
   let isTokenizing = false;
   let isMounting = false;
+  // Timestamp of the last mount attempt. Used to throttle the self-healing
+  // re-mount so a persistently failing mount can never spin in a tight loop.
+  let lastMountAttemptAt = 0;
 
   function showError(message) {
     $("#hsbt-card-error").text(message || "");
@@ -152,6 +155,7 @@
       }
 
       isMounting = true;
+      lastMountAttemptAt = Date.now();
       showError("");
 
       $("#hsbt-card-number").empty();
@@ -276,12 +280,89 @@
     return tokenIntent.id;
   }
 
+  // ---------------------------------------------------------------------------
+  // Self-healing re-mount (root-cause fix for "fields disappear on scroll /
+  // checkout update").
+  //
+  // The card fields are cross-origin iframes mounted into the #hsbt-card-* divs.
+  // Anything that replaces or re-renders that DOM destroys the iframes and blanks
+  // the fields: WooCommerce's checkout AJAX refresh (update_checkout) swaps the
+  // payment markup for fresh empty divs; an Elementor/theme re-render or iframe
+  // lazy-loader can rebuild the section; some mobile browsers discard off-screen
+  // iframes on scroll. Only the WooCommerce case fires `updated_checkout`, so the
+  // theme/scroll cases would otherwise leave the fields blank until a page reload.
+  //
+  // A MutationObserver watches the checkout DOM and re-mounts whenever the
+  // container is present but its iframes have vanished — so the fields reappear
+  // on their own, no matter what removed them. It never runs while a mount is in
+  // progress, is throttled against a failing-mount loop, and no-ops once the
+  // iframes are present, so it can't double-mount or spin.
+  // ---------------------------------------------------------------------------
+
+  const REMOUNT_COOLDOWN_MS = 1200;
+  let remountCheckTimer = null;
+  let observerStarted = false;
+
+  function cardWrapperPresent() {
+    return (
+      $("#hsbt-card-number").length > 0 &&
+      $("#hsbt-card-expiry").length > 0 &&
+      $("#hsbt-card-cvc").length > 0
+    );
+  }
+
+  function remountIfFieldsMissing() {
+    // A mount already in progress will finish and populate the iframes itself.
+    if (isMounting) {
+      return;
+    }
+    // Gateway markup isn't on the page (e.g. a different payment method) — skip.
+    if (!cardWrapperPresent()) {
+      return;
+    }
+    // Iframes are still mounted — the fields are fine.
+    if (hasMountedIframes()) {
+      return;
+    }
+    // Throttle: if a mount was just attempted, don't immediately try again (this
+    // also breaks any showError → mutation → re-mount feedback loop on failure).
+    if (Date.now() - lastMountAttemptAt < REMOUNT_COOLDOWN_MS) {
+      return;
+    }
+    // Container present but its iframes are gone → rebuild them.
+    mountCardElements();
+  }
+
+  function scheduleRemountCheck() {
+    // Debounce: DOM re-renders arrive in bursts; coalesce them into one check.
+    if (remountCheckTimer) {
+      return;
+    }
+    remountCheckTimer = setTimeout(function () {
+      remountCheckTimer = null;
+      remountIfFieldsMissing();
+    }, 200);
+  }
+
+  function startCheckoutObserver() {
+    if (observerStarted || typeof window.MutationObserver === "undefined") {
+      return;
+    }
+    // Watch the whole document body so a full-section re-render by the theme /
+    // Elementor is caught too (not just WooCommerce's in-form fragment swap).
+    // The callback is a cheap no-op unless our iframes have actually vanished.
+    const observer = new MutationObserver(scheduleRemountCheck);
+    observer.observe(document.body, { childList: true, subtree: true });
+    observerStarted = true;
+  }
+
   $(document.body).on("updated_checkout payment_method_selected", function () {
     setTimeout(mountCardElements, 500);
   });
 
   $(document).ready(function () {
     setTimeout(mountCardElements, 500);
+    startCheckoutObserver();
   });
 
   $("form.checkout").on("checkout_place_order_hsbt_gateway", function () {

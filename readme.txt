@@ -5,7 +5,7 @@ Requires at least: 6.0
 Tested up to: 6.6
 Requires PHP: 7.4
 WC requires at least: 7.0
-Stable tag: 0.3.1
+Stable tag: 0.3.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -45,39 +45,13 @@ in plain text - which is why it is left empty by default.
 
 == Changelog ==
 
+= 0.3.2 =
+* Fixed the card fields going blank/disappearing after scrolling or when the
+  WooCommerce checkout re-renders (AJAX update, or a theme/Elementor re-render
+  that doesn't fire WooCommerce's update event). The hosted card-field iframes
+  are destroyed whenever that DOM is replaced; the checkout now watches for this
+  and automatically re-mounts the fields, so they reappear without a page reload.
+  No change to payment or tokenization behaviour.
+
 = 0.3.1 =
-* Added a fresh per-submit idempotency nonce to checkout. Each deliberate "Place
-  Order" click generates a new nonce (crypto.randomUUID with a safe fallback)
-  that is sent to the backend, so an accidental network/AJAX retransmission of
-  the same submission is safely deduplicated (no double charge) while a genuine
-  retry after a decline is processed as a new payment attempt. Fixes the Stripe
-  "same key, different parameters" idempotency error on retries.
-
-= 0.3.0 =
-* Added shopper IP capture: the plugin now resolves the real customer IP at the
-  WordPress edge (Cloudflare / proxy headers, falling back to REMOTE_ADDR) and
-  forwards it with the payment so it appears on the transaction record.
-* Added a full order-details snapshot (products, per-unit prices, quantities,
-  variations, totals, tax, shipping, coupons, and fees) sent with each payment so
-  the complete order shows in the High Star transaction details.
-* Added a Plugin Monitoring health endpoint at /wp-json/highstar/v1/health that
-  reports the plugin, WooCommerce, WordPress, and PHP status so the High Star
-  backend can monitor each store. Read-only and exposes no keys or customer data.
-
-= 0.2.8 =
-* Added a small version label next to the gateway title on the WooCommerce
-  settings page (display-only; no change to checkout or payment handling).
-
-= 0.2.7 =
-* Added automatic updates via GitHub Releases (Plugin Update Checker), so
-  merchants get a normal "Update Now" button instead of installing a ZIP by hand.
-* Added a version constant (HSBT_VERSION) plus plugin path/URL constants, and
-  used the version constant to cache-bust the enqueued checkout script so buyers
-  always receive the current bt-checkout.js after an update.
-
-= 0.2.6 =
-* Fixed mobile card-field mounting: the Basis Theory card number, expiry, and
-  CVC fields now re-mount reliably when the checkout fragment is refreshed or the
-  payment method is re-selected on mobile.
-* Added dns-prefetch and preconnect resource hints for the Basis Theory host to
-  speed up card-field loading on the checkout page.
+* update plugin
