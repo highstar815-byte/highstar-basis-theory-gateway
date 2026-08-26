@@ -2,7 +2,7 @@
 /**
  * Plugin Name: High Star Payment Gateway
  * Description: WooCommerce custom payment gateway using Secure payment gateway configuration.
- * Version: 0.3.2
+ * Version: 0.3.3
  * Author: High Star Payments
  * Requires at least: 6.0
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
  * Plugin constants. Each guarded with defined() so a double-load cannot fatal.
  */
 if (!defined('HSBT_VERSION')) {
-    define('HSBT_VERSION', '0.3.2');
+    define('HSBT_VERSION', '0.3.3');
 }
 if (!defined('HSBT_PLUGIN_FILE')) {
     define('HSBT_PLUGIN_FILE', __FILE__);
@@ -67,6 +67,12 @@ function hsbt_init_gateway() {
             // Hardcoded values requested by client.
             $this->highstar_api_url     = 'https://highstarpayments.com/api/payments/create';
             $this->bt_environment       = 'us';
+            // Platform Stripe publishable key (public — safe to ship). Hardcoded like
+            // the API URL above so it deploys to every merchant site via the updater
+            // with NO per-merchant setup. It belongs to the same platform account as
+            // the backend secret key; each merchant's own Account ID scopes the Radar
+            // Session to their connected account (stripeAccount). Empty = feature off.
+            $this->stripe_publishable_key = 'pk_live_51TX2kO4FVYb0x3SEPbn7uPOYf3ekzZXrvkz9IuAJ4X1rHzydxUmGZC2BnxmP1xGLa60OU9Ah0BdPowCEWhKkIwGh00xuYRpzlk';
 
             $this->init_form_fields();
             $this->init_settings();
@@ -161,6 +167,11 @@ function hsbt_init_gateway() {
             // backend deduplicate an accidental retransmission of the same submit
             // while treating a deliberate retry as a new payment attempt.
             echo '<input type="hidden" name="hsbt_payment_nonce" id="hsbt_payment_nonce" value="">';
+            // Stripe Radar Session id (rse_...) set by bt-checkout.js. Carries no card
+            // data — it lets Radar attribute the real shopper IP + device signals to
+            // this charge. Empty when Radar Session is not configured or could not be
+            // created; the backend simply omits it in that case.
+            echo '<input type="hidden" name="hsbt_radar_session_id" id="hsbt_radar_session_id" value="">';
             echo '<div id="hsbt-card-error" style="color:red;margin-top:8px;font-size:14px;"></div>';
         }
 
@@ -177,18 +188,35 @@ function hsbt_init_gateway() {
                 true
             );
 
+            // Stripe.js — loaded ONLY to create a Radar Session (fraud signals). It
+            // does NOT handle card entry; that stays entirely on Basis Theory. Loaded
+            // before bt-checkout.js so window.Stripe is ready; harmless when no
+            // publishable key is configured (bt-checkout.js then skips the session).
+            wp_enqueue_script(
+                'hsbt-stripe-js',
+                'https://js.stripe.com/v3/',
+                array(),
+                null,
+                true
+            );
+
             wp_enqueue_script(
                 'hsbt-checkout',
                 HSBT_PLUGIN_URL . 'assets/bt-checkout.js',
-                array('jquery', 'hsbt-basis-theory-elements'),
+                array('jquery', 'hsbt-basis-theory-elements', 'hsbt-stripe-js'),
                 HSBT_VERSION,
                 true
             );
 
             wp_localize_script('hsbt-checkout', 'hsbtData', array(
-                'publicKey'   => $this->bt_public_key,
-                'environment' => 'us',
-                'gatewayId'   => $this->id,
+                'publicKey'            => $this->bt_public_key,
+                'environment'          => 'us',
+                'gatewayId'            => $this->id,
+                // Radar Session config. A publishable key enables the session; the
+                // connected account id scopes it to the account the charge is made on
+                // (direct charge). When the key is empty the session is skipped.
+                'stripePublishableKey' => $this->stripe_publishable_key,
+                'connectedAccountId'   => $this->connected_account_id,
             ));
         }
 
@@ -578,6 +606,14 @@ function hsbt_init_gateway() {
                 ? sanitize_text_field(wp_unslash($_POST['hsbt_payment_nonce']))
                 : '';
 
+            // Stripe Radar Session id (rse_...) created client-side by bt-checkout.js.
+            // Optional and non-blocking: empty when Radar Session isn't configured or
+            // failed to create. Forwarded to the backend, which attaches it to the
+            // Stripe PaymentIntent so Radar sees the real shopper IP + device signals.
+            $radar_session_id = isset($_POST['hsbt_radar_session_id'])
+                ? sanitize_text_field(wp_unslash($_POST['hsbt_radar_session_id']))
+                : '';
+
             if (
                 empty($this->bt_private_key) ||
                 empty($this->connected_account_id)
@@ -611,6 +647,12 @@ function hsbt_init_gateway() {
                 // (server-to-server calls can't see the buyer's IP otherwise).
                 'client_ip'   => $client_ip,
                 'ip_address'  => $client_ip,
+
+                // Client-side Stripe Radar Session (rse_...). The only reliable way to
+                // attribute the genuine shopper IP + device signals to the charge —
+                // server-to-server calls otherwise present this host's IP to Stripe.
+                // Empty string when not configured/available; the backend omits it.
+                'radar_session_id' => $radar_session_id,
 
                 'customer_data' => array(
                     'id'    => (string) $order->get_customer_id(),

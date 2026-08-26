@@ -5,7 +5,7 @@ Requires at least: 6.0
 Tested up to: 6.6
 Requires PHP: 7.4
 WC requires at least: 7.0
-Stable tag: 0.3.2
+Stable tag: 0.3.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -44,6 +44,10 @@ token is only needed for a private repository, and it would ship to every store
 in plain text - which is why it is left empty by default.
 
 == Changelog ==
+
+= 0.3.3 =
+* Added Stripe Radar Session support so the shopper's real IP and device signals
+  reach Stripe Radar for fraud detection. 
 
 = 0.3.2 =
 * Fixed the card fields going blank/disappearing after scrolling or when the
