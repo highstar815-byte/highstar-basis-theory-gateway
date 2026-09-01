@@ -19,9 +19,6 @@
   // Timestamp of the last mount attempt. Used to throttle the self-healing
   // re-mount so a persistently failing mount can never spin in a tight loop.
   let lastMountAttemptAt = 0;
-  // Lazily-created Stripe.js instance, used ONLY for Radar Sessions (fraud
-  // signals) — never for card entry, which stays entirely on Basis Theory.
-  let stripeInstance = null;
 
   function showError(message) {
     $("#hsbt-card-error").text(message || "");
@@ -85,66 +82,6 @@
   function ensurePaymentNonce() {
     if (!$("#hsbt_payment_nonce").val()) {
       setPaymentNonce();
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Stripe Radar Session (optional fraud signal).
-  //
-  // Basis Theory tokenizes the card, so our backend creates the Stripe charge
-  // server-to-server — which means Stripe would otherwise attribute the charge to
-  // our server's IP, not the shopper's. A Radar Session, created here in the
-  // browser via Stripe.js, captures the real shopper IP + device/browser signals;
-  // the backend attaches it to the PaymentIntent (radar_options[session]) so Radar
-  // scores the genuine client.
-  //
-  // This NEVER touches the card — Stripe.js is used ONLY for createRadarSession().
-  // It is fully optional and non-blocking (per Stripe's guidance): if no
-  // publishable key is configured, Stripe.js is unavailable, or the call fails, we
-  // leave the hidden field empty and checkout proceeds exactly as before.
-  // ---------------------------------------------------------------------------
-  function getStripeInstance() {
-    if (stripeInstance) {
-      return stripeInstance;
-    }
-    if (
-      typeof window.Stripe !== "function" ||
-      !window.hsbtData ||
-      !hsbtData.stripePublishableKey
-    ) {
-      return null;
-    }
-    const options = {};
-    // Charges are direct charges on the connected account, so the session must be
-    // created in that account's context to associate with the charge's Radar.
-    if (hsbtData.connectedAccountId) {
-      options.stripeAccount = hsbtData.connectedAccountId;
-    }
-    try {
-      stripeInstance = window.Stripe(hsbtData.stripePublishableKey, options);
-    } catch (e) {
-      stripeInstance = null;
-    }
-    return stripeInstance;
-  }
-
-  async function ensureRadarSession() {
-    try {
-      // Already created for this submission — reuse it.
-      if ($("#hsbt_radar_session_id").val()) {
-        return;
-      }
-      const stripe = getStripeInstance();
-      if (!stripe || typeof stripe.createRadarSession !== "function") {
-        return;
-      }
-      const result = await stripe.createRadarSession();
-      if (result && result.radarSession && result.radarSession.id) {
-        $("#hsbt_radar_session_id").val(result.radarSession.id);
-      }
-    } catch (error) {
-      // Non-blocking by design: never hold up checkout for a fraud signal.
-      console.warn("Stripe Radar Session skipped:", error);
     }
   }
 
@@ -447,10 +384,7 @@
     isTokenizing = true;
     showError("");
 
-    // Tokenize the card and create the Radar Session in parallel. ensureRadarSession
-    // never rejects (it swallows its own errors), so only a tokenization failure can
-    // reach .catch — checkout is never blocked by the Radar Session.
-    Promise.all([createTokenIntent(), ensureRadarSession()])
+    createTokenIntent()
       .then(function () {
         isTokenizing = false;
         $("form.checkout").trigger("submit");
