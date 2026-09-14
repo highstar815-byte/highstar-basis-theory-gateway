@@ -85,6 +85,32 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Fresh token-intent per RETRY (root-cause fix for "Failed to find one or more
+  // token intent values").
+  //
+  // A Basis Theory token-intent is short-lived and single-use. If the previous
+  // Place Order failed (card declined, backend/technical error, or a lost
+  // response), the SAME token-intent must NOT be sent again — the backend proxy
+  // can no longer resolve it, which surfaces as an "Invalid proxy request /
+  // Failed to find token intent values" error. So on any checkout failure we
+  // drop the cached token-intent id AND its nonce; the next Place Order then
+  // re-tokenizes (createTokenIntent), producing a FRESH token-intent + a FRESH
+  // nonce. The card the shopper typed is untouched (the BT iframes keep their
+  // value), so a retry needs no re-entry.
+  //
+  // Safety net alongside this: the backend submission ledger replays the first
+  // result for an identical (same-nonce) resubmission and refuses to charge an
+  // order that already succeeded, so this clearing can never cause a double
+  // charge even in the "charge succeeded but response was lost" case.
+  // ---------------------------------------------------------------------------
+  function clearTokenIntentForRetry() {
+    $("#hsbt_token_intent_id").val("");
+    $("#hsbt_payment_nonce").val("");
+    // Allow the next Place Order click to tokenize again.
+    isTokenizing = false;
+  }
+
   function getSelectedPaymentMethod() {
     return $('input[name="payment_method"]:checked').val();
   }
@@ -360,6 +386,15 @@
     setTimeout(mountCardElements, 500);
   });
 
+  // Any failed checkout (card decline, backend/technical error, lost response)
+  // invalidates the token-intent used for that attempt — drop it so the next
+  // Place Order mints a fresh one instead of re-sending a consumed/expired
+  // token-intent (which is what produced "Failed to find one or more token
+  // intent values"). WooCommerce fires this on every failed place-order.
+  $(document.body).on("checkout_error", function () {
+    clearTokenIntentForRetry();
+  });
+
   $(document).ready(function () {
     setTimeout(mountCardElements, 500);
     startCheckoutObserver();
@@ -384,6 +419,8 @@
     isTokenizing = true;
     showError("");
 
+    // Tokenize the card, then submit. A tokenization failure reaches .catch and
+    // shows an inline error without submitting the checkout form.
     createTokenIntent()
       .then(function () {
         isTokenizing = false;
