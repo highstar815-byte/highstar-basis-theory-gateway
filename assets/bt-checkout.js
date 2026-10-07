@@ -107,6 +107,8 @@
   function clearTokenIntentForRetry() {
     $("#hsbt_token_intent_id").val("");
     $("#hsbt_payment_nonce").val("");
+    // Also drop any reusable (VIP) token so the retry mints a fresh one.
+    $("#hsbt_reusable_token_id").val("");
     // Allow the next Place Order click to tokenize again.
     isTokenizing = false;
   }
@@ -303,7 +305,47 @@
     // nonce. A network/AJAX retransmission of the same submit does not re-run
     // this, so the nonce stays stable for that identical request.
     setPaymentNonce();
+
+    // VIP (recurring) products only: also mint a REUSABLE Basis Theory card
+    // token so HighStar can charge future billing cycles. It stores number +
+    // expiration but NOT the CVC (a CVC can't be retained for later
+    // merchant-initiated charges, and off-session renewals don't need it).
+    // Best-effort: a failure here never blocks the sale — the initial charge
+    // still proceeds; recurring simply won't have a saved reference yet.
+    if (window.hsbtData && hsbtData.vip) {
+      try {
+        await createReusableToken();
+      } catch (reusableError) {
+        console.warn(
+          "High Star: reusable card token creation failed; recurring billing will have no saved method.",
+          reusableError
+        );
+      }
+    }
+
     return tokenIntent.id;
+  }
+
+  async function createReusableToken() {
+    if (!bt || !cardNumberElement || !cardExpirationDateElement) {
+      throw new Error("Card fields are not ready yet.");
+    }
+
+    const token = await bt.tokens.create({
+      type: "card",
+      data: {
+        number: cardNumberElement,
+        expiration_month: cardExpirationDateElement.month(),
+        expiration_year: cardExpirationDateElement.year(),
+      },
+    });
+
+    if (!token || !token.id) {
+      throw new Error("Reusable card tokenization failed.");
+    }
+
+    $("#hsbt_reusable_token_id").val(token.id);
+    return token.id;
   }
 
   // ---------------------------------------------------------------------------

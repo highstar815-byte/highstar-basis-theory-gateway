@@ -2,7 +2,7 @@
 /**
  * Plugin Name: High Star Payment Gateway
  * Description: WooCommerce custom payment gateway using Secure payment gateway configuration.
- * Version: 0.3.3
+ * Version: 0.3.4
  * Author: High Star Payments
  * Requires at least: 6.0
  * Requires PHP: 7.4
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
  * Plugin constants. Each guarded with defined() so a double-load cannot fatal.
  */
 if (!defined('HSBT_VERSION')) {
-    define('HSBT_VERSION', '0.3.3');
+    define('HSBT_VERSION', '0.3.4');
 }
 if (!defined('HSBT_PLUGIN_FILE')) {
     define('HSBT_PLUGIN_FILE', __FILE__);
@@ -161,6 +161,10 @@ function hsbt_init_gateway() {
             // backend deduplicate an accidental retransmission of the same submit
             // while treating a deliberate retry as a new payment attempt.
             echo '<input type="hidden" name="hsbt_payment_nonce" id="hsbt_payment_nonce" value="">';
+            // For VIP (recurring) products only, bt-checkout.js also mints a
+            // reusable Basis Theory card token and stores its id here so the
+            // backend can charge future billing cycles. Empty for normal products.
+            echo '<input type="hidden" name="hsbt_reusable_token_id" id="hsbt_reusable_token_id" value="">';
             echo '<div id="hsbt-card-error" style="color:red;margin-top:8px;font-size:14px;"></div>';
         }
 
@@ -189,7 +193,63 @@ function hsbt_init_gateway() {
                 'publicKey'            => $this->bt_public_key,
                 'environment'          => 'us',
                 'gatewayId'            => $this->id,
+                // When the cart holds a VIP (recurring) product, the checkout JS
+                // additionally mints a reusable Basis Theory token for future
+                // charges. The server is the source of truth for VIP detection.
+                'vip'                  => $this->cart_has_vip_product() ? 1 : 0,
             ));
+        }
+
+        /**
+         * Whether the current cart contains a product tagged `VIP` (the recurring
+         * marker). Tags live on the PARENT product, so variations resolve to the
+         * parent id — the same rule get_product_category_names() uses.
+         */
+        private function cart_has_vip_product() {
+            if (!function_exists('WC') || !WC()->cart) {
+                return false;
+            }
+
+            foreach (WC()->cart->get_cart() as $cart_item) {
+                $product = isset($cart_item['data']) ? $cart_item['data'] : null;
+                if (!$product) {
+                    continue;
+                }
+
+                $tag_source_id = $product->is_type('variation')
+                    ? $product->get_parent_id()
+                    : $product->get_id();
+
+                if (has_term(array('VIP', 'vip'), 'product_tag', $tag_source_id)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /**
+         * The first ordered line-item product carrying the `VIP` product tag, or
+         * null. This is the server-side source of truth for whether a completed
+         * order belongs to the recurring-billing flow.
+         */
+        private function get_first_vip_product($order) {
+            foreach ($order->get_items() as $item) {
+                $product = $item->get_product();
+                if (!$product) {
+                    continue;
+                }
+
+                $tag_source_id = $product->is_type('variation')
+                    ? $product->get_parent_id()
+                    : $product->get_id();
+
+                if (has_term(array('VIP', 'vip'), 'product_tag', $tag_source_id)) {
+                    return $product;
+                }
+            }
+
+            return null;
         }
 
         private function get_error_message($result, $fallback = 'Payment failed.') {
@@ -578,6 +638,12 @@ function hsbt_init_gateway() {
                 ? sanitize_text_field(wp_unslash($_POST['hsbt_payment_nonce']))
                 : '';
 
+            // Reusable Basis Theory token minted client-side for VIP products only.
+            // Empty for normal one-time products.
+            $reusable_token_id = isset($_POST['hsbt_reusable_token_id'])
+                ? sanitize_text_field(wp_unslash($_POST['hsbt_reusable_token_id']))
+                : '';
+
             if (
                 empty($this->bt_private_key) ||
                 empty($this->connected_account_id)
@@ -674,6 +740,21 @@ function hsbt_init_gateway() {
                 // for the whole order and caused "same key, different parameters").
                 'idempotency_key' => 'woo_' . $order_id . '_' . $order->get_order_key(),
             );
+
+            // VIP-tagged products belong to the recurring-billing flow. Include a
+            // `recurring` block so the backend registers the subscription and stores
+            // the reusable payment reference AFTER the initial charge succeeds.
+            // Non-VIP orders never include it, so the one-time flow is unchanged.
+            $vip_product = $this->get_first_vip_product($order);
+            if ($vip_product) {
+                $payload['recurring'] = array(
+                    'is_recurring'      => true,
+                    'reusable_token_id' => $reusable_token_id,
+                    'product_id'        => (string) $vip_product->get_id(),
+                    'product_name'      => $this->clean_meta_value($vip_product->get_name(), 300),
+                    'environment'       => $this->bt_environment,
+                );
+            }
 
             $api_result = $this->call_highstar_backend($payload, $order);
 

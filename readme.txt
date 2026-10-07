@@ -5,7 +5,7 @@ Requires at least: 6.0
 Tested up to: 6.6
 Requires PHP: 7.4
 WC requires at least: 7.0
-Stable tag: 0.3.3
+Stable tag: 0.3.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -44,6 +44,13 @@ token is only needed for a private repository, and it would ship to every store
 in plain text - which is why it is left empty by default.
 
 == Changelog ==
+
+= 0.3.4 =
+* Added support for VIP (recurring) products. When the cart contains a product
+  tagged `VIP`, the checkout now additionally mints a reusable Basis Theory card
+  token and passes its id to the backend so future billing cycles can be charged.
+  Normal (non-VIP) products are unchanged - no reusable token is created. VIP
+  detection is performed server-side so the browser cannot spoof it.
 
 = 0.3.3 =
 * Fixed the recurring "Failed to find one or more token intent values" error on
