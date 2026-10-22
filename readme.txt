@@ -2,7 +2,7 @@
 Contributors: highstarpayments
 Tags: woocommerce, payment gateway, credit card, basis theory, tokenization
 Requires at least: 6.0
-Tested up to: 6.6
+Tested up to: 7.1
 Requires PHP: 8.2
 WC requires at least: 7.0
 Stable tag: 0.3.5
@@ -58,6 +58,8 @@ in plain text - which is why it is left empty by default.
 * No change to payment, tokenization, recurring/VIP, or checkout behaviour. The
   card flow, idempotency nonce, token-intent handling, and backend payload are
   byte-for-byte unchanged (this is a code-hardening patch only).
+* Bumped "Tested up to" to WordPress 7.1 (latest stable) to clear the "not tested
+  with your current version of WordPress" compatibility notice. Metadata only.
 
 = 0.3.4 =
 * Added support for VIP (recurring) products. When the cart contains a product
