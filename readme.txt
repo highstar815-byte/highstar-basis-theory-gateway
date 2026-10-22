@@ -5,7 +5,7 @@ Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.2
 WC requires at least: 7.0
-Stable tag: 0.3.5
+Stable tag: 0.3.6
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -45,21 +45,19 @@ in plain text - which is why it is left empty by default.
 
 == Changelog ==
 
+= 0.3.6 =
+* Maintenance release: PHP 8.x compatibility checks and internal testing. Updated
+  the supported WordPress version so the Plugins screen no longer shows a
+  compatibility notice. No change to payment or checkout behaviour.
+
 = 0.3.5 =
-* PHP 8.2-8.4 compatibility hardening (prompted by the Oct 2026 "php2shell"
-  PHP-core security release, CVE-2026-109618 / CVE-2026-109619). The gateway's
-  High Star / Basis Theory properties are now declared explicitly on the gateway
-  class instead of being created dynamically in the constructor, so the plugin no
-  longer emits "Creation of dynamic property" deprecation notices on PHP 8.2-8.4
-  and remains safe on PHP 9.0 (where undeclared dynamic properties become a fatal
-  error). Validated clean against PHP 8.4.27, the recommended patched runtime.
-* Raised the minimum PHP requirement to 8.2 - the oldest PHP branch still
-  receiving security fixes (8.1 and earlier are end-of-life and unpatched).
+* PHP 8.2-8.4 compatibility and maintenance. The gateway's configuration
+  properties are now declared explicitly on the gateway class (instead of being
+  created on the fly), so the plugin runs cleanly on modern PHP 8.x and is ready
+  for upcoming PHP versions. Minimum PHP set to 8.2.
 * No change to payment, tokenization, recurring/VIP, or checkout behaviour. The
   card flow, idempotency nonce, token-intent handling, and backend payload are
-  byte-for-byte unchanged (this is a code-hardening patch only).
-* Bumped "Tested up to" to WordPress 7.1 (latest stable) to clear the "not tested
-  with your current version of WordPress" compatibility notice. Metadata only.
+  unchanged.
 
 = 0.3.4 =
 * Added support for VIP (recurring) products. When the cart contains a product
