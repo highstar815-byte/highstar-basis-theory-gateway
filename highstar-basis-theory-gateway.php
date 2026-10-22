@@ -2,10 +2,10 @@
 /**
  * Plugin Name: High Star Payment Gateway
  * Description: WooCommerce custom payment gateway using Secure payment gateway configuration.
- * Version: 0.3.4
+ * Version: 0.3.5
  * Author: High Star Payments
  * Requires at least: 6.0
- * Requires PHP: 7.4
+ * Requires PHP: 8.2
  * WC requires at least: 7.0
  * Update URI: https://github.com/highstar815-byte/highstar-basis-theory-gateway
  */
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
  * Plugin constants. Each guarded with defined() so a double-load cannot fatal.
  */
 if (!defined('HSBT_VERSION')) {
-    define('HSBT_VERSION', '0.3.4');
+    define('HSBT_VERSION', '0.3.5');
 }
 if (!defined('HSBT_PLUGIN_FILE')) {
     define('HSBT_PLUGIN_FILE', __FILE__);
@@ -56,6 +56,34 @@ function hsbt_init_gateway() {
     }
 
     class WC_Gateway_HSBT extends WC_Payment_Gateway {
+
+        /**
+         * Gateway-specific properties.
+         *
+         * Declared explicitly (rather than being created dynamically in the
+         * constructor) so the gateway emits no "Creation of dynamic property"
+         * E_DEPRECATED notices on PHP 8.2–8.4 and stays safe on PHP 9.0, where
+         * undeclared dynamic properties become a fatal Error. WC_Payment_Gateway
+         * already declares the standard properties (id, title, enabled, …); only
+         * the High Star / Basis Theory fields are declared here. Untyped on
+         * purpose: assignment semantics are identical to the previous dynamic
+         * properties, so payment behaviour is unchanged.
+         *
+         * @var string
+         */
+        public $highstar_api_url;
+
+        /** @var string Basis Theory environment (hardcoded to 'us'). */
+        public $bt_environment;
+
+        /** @var string Basis Theory public (publishable) API key. */
+        public $bt_public_key;
+
+        /** @var string Basis Theory private / proxy key. */
+        public $bt_private_key;
+
+        /** @var string Connected (merchant) account id. */
+        public $connected_account_id;
 
         public function __construct() {
             $this->id                 = 'hsbt_gateway';
