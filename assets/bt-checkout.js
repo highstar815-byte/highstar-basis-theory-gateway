@@ -82,11 +82,29 @@
   let mountGeneration = 0;
 
   // Ready-timeout + bounded self-heal (guidance #4).
-  const READY_TIMEOUT_MS = 6000; // how long to wait for all three ready events
+  // Touch/coarse-pointer devices (the reported iPhone Safari population) load the
+  // cross-origin frames over slower mobile networks, so give them a longer first
+  // window before any heal — destroying a frame that is still downloading only
+  // restarts the download (Safari reloads a moved/recreated iframe).
+  const IS_COARSE_POINTER =
+    (typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches) ||
+    "ontouchstart" in window;
+  const READY_TIMEOUT_MS = IS_COARSE_POINTER ? 10000 : 6000;
   const MAX_HEAL_ATTEMPTS = 2; // auto unmount+remount this many times before we
   //                              surface a manual reload control
   let readyTimer = null;
   let healAttempts = 0;
+  // A frame that has already made progress (at least one field fired `ready`) is
+  // granted ONE non-destructive grace extension before we tear it down, so a
+  // nearly-finished slow frame is never cancelled mid-download. Per-episode.
+  let graceUsed = false;
+  // Durable "a recovery episode is unresolved" marker. Set the moment we begin
+  // recovering (or surface the reload control) and cleared ONLY by resetHealBudget
+  // at a genuine fresh-episode boundary. It survives the in-flight unmount/remount
+  // of a heal attempt, so a frequent updated_checkout poller firing mid-recovery
+  // can't be mistaken for a clean slate and re-grant the heal budget.
+  let healInProgress = false;
   // One final, delayed auto-retry after the manual reload control is surfaced, so
   // a transient failure can still self-recover on a static page where the buyer
   // takes no action and no DOM mutation would otherwise re-trigger a mount. Used
@@ -291,14 +309,25 @@
     }
   }
 
+  // Reset the whole self-heal budget — call ONLY at genuine fresh-episode
+  // boundaries (fields went ready, container replaced, method (re)selected, buyer
+  // reloaded, bfcache restore). The grace extension is deliberately part of this
+  // budget so it is granted ONCE PER EPISODE, not once per heal attempt — resetting
+  // it on every remount is what would stack the stuck window to tens of seconds.
+  function resetHealBudget() {
+    healAttempts = 0;
+    graceUsed = false;
+    exhaustionRetryUsed = false;
+    healInProgress = false;
+    clearExhaustionRetryTimer();
+  }
+
   // All three elements reported ready → the fields are genuinely interactive.
   function onAllElementsReady() {
     clearReadyTimer();
-    clearExhaustionRetryTimer();
     isReady = true;
     isMounting = false;
-    healAttempts = 0;
-    exhaustionRetryUsed = false;
+    resetHealBudget();
     hideLoadingState();
     hideReloadOption();
     showError("");
@@ -323,7 +352,38 @@
       return; // raced with a late success — nothing to do
     }
 
+    // The buyer switched to another method mid-load — don't burn the heal budget
+    // or arm retries for a gateway that isn't even showing (guidance #1/#3).
+    if (!isHighStarSelected()) {
+      isMounting = false;
+      refreshCheckoutGate();
+      return;
+    }
+
+    // Mark the episode unresolved for the duration of this recovery, so a
+    // concurrent updated_checkout can't mistake our own in-flight remount for a
+    // fresh container and re-grant the heal budget.
+    healInProgress = true;
+
+    // Partial progress: the frames are still present and at least one field has
+    // already become interactive, so the SDK + network are clearly working and a
+    // slow frame is simply still downloading. Destroying it now would cancel that
+    // in-flight download (Safari reloads a recreated iframe) and could turn a slow
+    // load into a permanently dead one — the opposite of what we want. Grant ONE
+    // non-destructive grace extension instead of remounting (guidance #1).
+    if (
+      !graceUsed &&
+      hasMountedIframes() &&
+      (elementReady.number || elementReady.expiry || elementReady.cvc)
+    ) {
+      graceUsed = true;
+      startReadyTimer(mountGeneration);
+      return;
+    }
+
     if (anyFieldDirty()) {
+      // The buyer has typed into a field that came up — never silently wipe it
+      // with an automatic remount; offer a manual reload instead (guidance #4).
       isMounting = false;
       showReloadOption();
       refreshCheckoutGate();
@@ -368,6 +428,7 @@
       }
       exhaustionRetryUsed = true;
       healAttempts = 0;
+      graceUsed = false; // this delayed retry is a fresh cycle → fresh grace
       unmountCardElements();
       isMounting = false;
       lastMountAttemptAt = 0;
@@ -375,15 +436,23 @@
     }, EXHAUSTION_RETRY_MS);
   }
 
-  // Ready events didn't all arrive in time → run the shared recovery.
-  function handleReadyTimeout() {
+  // Ready events didn't all arrive in time → run the shared recovery, but ONLY if
+  // this watchdog still belongs to the current mount generation. A superseded
+  // attempt's timer must never drive recovery for the live one (and must not taint
+  // the submit handler's `!readyTimer` check).
+  function handleReadyTimeout(generation) {
     readyTimer = null;
+    if (generation !== mountGeneration) {
+      return;
+    }
     recoverFromFailedMount();
   }
 
-  function startReadyTimer() {
+  function startReadyTimer(generation) {
     clearReadyTimer();
-    readyTimer = setTimeout(handleReadyTimeout, READY_TIMEOUT_MS);
+    readyTimer = setTimeout(function () {
+      handleReadyTimeout(generation);
+    }, READY_TIMEOUT_MS);
   }
 
   // Tear down the current elements (used by the self-heal and before a rebuild).
@@ -420,6 +489,13 @@
     fieldDirty.number = false;
     fieldDirty.expiry = false;
     fieldDirty.cvc = false;
+    // NOTE: graceUsed is intentionally NOT reset here. It is a per-EPISODE latch
+    // (reset via resetHealBudget at genuine boundaries), so it must survive the
+    // unmount+remount of a self-heal attempt — otherwise each heal would re-grant
+    // a full grace window and stack the stuck time.
+    // Drop the watchdog bound to the torn-down elements so it can't fire a stray
+    // recovery or taint the submit handler's `!readyTimer` check.
+    clearReadyTimer();
     // Invalidate any outstanding ready handlers from the torn-down elements.
     mountGeneration += 1;
   }
@@ -438,6 +514,13 @@
       elementReady.number = false;
       elementReady.expiry = false;
       elementReady.cvc = false;
+      // NOTE: graceUsed and healInProgress are NOT reset here. This runs for our
+      // OWN in-flight empty containers too (not only a genuine WooCommerce
+      // replacement), so clearing the episode budget here would let a concurrent
+      // updated_checkout re-grant grace/heal mid-recovery. They are reset only at
+      // true boundaries via resetHealBudget().
+      // Drop the watchdog bound to the now-destroyed elements (see above).
+      clearReadyTimer();
       // Invalidate ready handlers bound to the now-destroyed elements.
       mountGeneration += 1;
     }
@@ -556,6 +639,21 @@
         return;
       }
 
+      // Central data-loss guard (guidance #4): if frames are present and the buyer
+      // has already typed into one that came up, NEVER destroy them with an
+      // automatic rebuild — surface the manual reload instead. This single point
+      // protects EVERY automatic caller (updated_checkout, the observer, the
+      // settle timer, document.ready), not just the submit/method-switch paths.
+      // Only the buyer-initiated reload button may intentionally discard input.
+      // (We are past the isMounting/isReady guard, so !isReady holds here.)
+      if (hasMountedIframes() && anyFieldDirty()) {
+        healInProgress = true;
+        showReloadOption();
+        refreshCheckoutGate();
+        armExhaustionRetry();
+        return;
+      }
+
       isMounting = true;
       lastMountAttemptAt = Date.now();
       showError("");
@@ -573,12 +671,15 @@
       fieldDirty.number = false;
       fieldDirty.expiry = false;
       fieldDirty.cvc = false;
+      // graceUsed is per-episode (see resetHealBudget); a heal remount must NOT
+      // re-grant grace, so it is deliberately not reset at mount start.
       isReady = false;
 
       // Arm the watchdog BEFORE initializing the SDK (guidance #4). It covers the
       // whole attempt — init, create AND mount+ready — so even if SDK init hangs
       // or never settles, recovery still runs instead of stranding isMounting=true.
-      startReadyTimer();
+      // Pinned to this generation so a superseded attempt's timer can't fire.
+      startReadyTimer(generation);
 
       // We're about to (re)create the frames, so clear whatever is in the
       // containers first. This is the ONLY place a container is emptied, and only
@@ -659,12 +760,15 @@
       ]);
 
       // Superseded while mounting — our frames are orphans (a newer attempt may
-      // already own the containers). Tear down OUR OWN elements via the locals and
-      // leave all shared state/timers to the current generation.
+      // already own the containers). Unmount ONLY our own element objects via the
+      // locals; pass no selector so we never .empty() a shared container that the
+      // newer generation may have already mounted its live frames into (that would
+      // kill them and recreate the dead-field symptom). Leave all shared
+      // state/timers to the current generation.
       if (generation !== mountGeneration) {
-        safeUnmount(numberEl, "#hsbt-card-number");
-        safeUnmount(expiryEl, "#hsbt-card-expiry");
-        safeUnmount(cvcEl, "#hsbt-card-cvc");
+        safeUnmount(numberEl, null);
+        safeUnmount(expiryEl, null);
+        safeUnmount(cvcEl, null);
         return;
       }
 
@@ -867,6 +971,29 @@
     // stale state FIRST so the Place Order gate immediately reflects "fields not
     // ready" and can't briefly allow a submit into dead frames.
     resetElementsIfCheckoutWasRefreshed();
+
+    // A genuine markup replacement (fresh, empty containers) is a clean slate and
+    // deserves a fresh self-heal budget — BUT only when we're not already in the
+    // middle of a stuck-episode recovery. A page that fires updated_checkout often
+    // (shipping / coupon / totals pollers) must not perpetually cancel the pending
+    // exhaustion retry or re-grant the heal budget, which would un-bound the heal
+    // loop and disarm the idle-page safety net. An active recovery — the reload
+    // control is visible, or an exhaustion retry is already armed — is left intact.
+    if (cardWrapperPresent() && !hasMountedIframes()) {
+      // An unresolved recovery episode (healInProgress) means our OWN in-flight
+      // remount emptied the containers — not a fresh WooCommerce replacement — so
+      // we must not re-grant the budget. The timer/reload-visible terms are extra
+      // belt-and-suspenders; healInProgress is the durable signal that survives the
+      // mid-recovery unmount and mountCardElements' hideReloadOption().
+      const stuckEpisodeActive =
+        healInProgress ||
+        !!exhaustionRetryTimer ||
+        $("#hsbt-card-reload").is(":visible");
+      if (!stuckEpisodeActive) {
+        resetHealBudget();
+      }
+    }
+
     refreshCheckoutGate();
     scheduleMount();
   });
@@ -888,11 +1015,19 @@
     }
 
     // The buyer just switched TO High Star and its box is now visible. Give a
-    // fresh self-heal budget and (re)build. If a dead frame had been pre-mounted
-    // while the box was hidden, drop it first so we rebuild in the visible box.
-    healAttempts = 0;
-    exhaustionRetryUsed = false;
-    clearExhaustionRetryTimer();
+    // fresh self-heal budget and (re)build.
+    resetHealBudget();
+
+    // A present-but-not-ready frame that already holds typed data must not be
+    // silently wiped by a rebuild — offer a manual reload instead (guidance #4).
+    if (!isMounting && hasMountedIframes() && !isReady && anyFieldDirty()) {
+      showReloadOption();
+      refreshCheckoutGate();
+      return;
+    }
+
+    // A dead frame pre-mounted while the box was hidden (no typed data) — drop it
+    // so we rebuild cleanly in the now-visible container.
     if (!isMounting && hasMountedIframes() && !isReady) {
       unmountCardElements();
     }
@@ -915,9 +1050,7 @@
     e.preventDefault();
     hideReloadOption();
     showError("");
-    healAttempts = 0;
-    exhaustionRetryUsed = false;
-    clearExhaustionRetryTimer();
+    resetHealBudget();
     unmountCardElements();
     isMounting = false;
     lastMountAttemptAt = 0; // allow an immediate rebuild
@@ -934,11 +1067,9 @@
     if (!original || !original.persisted) {
       return;
     }
+    resetHealBudget();
     unmountCardElements();
     isMounting = false;
-    healAttempts = 0;
-    exhaustionRetryUsed = false;
-    clearExhaustionRetryTimer();
     lastMountAttemptAt = 0;
     refreshCheckoutGate();
     scheduleMount();
@@ -970,15 +1101,26 @@
       // prior attempt already gave up and surfaced the reload control), clicking
       // Place Order itself kicks off a fresh mount instead of only showing text.
       if (!isMounting && !readyTimer) {
-        healAttempts = 0;
-        if (hasMountedIframes()) {
-          unmountCardElements();
+        if (anyFieldDirty()) {
+          // The buyer already typed a card — surface the manual reload (its own
+          // message explains) rather than wiping their input with a rebuild.
+          showReloadOption();
+        } else {
+          resetHealBudget();
+          if (hasMountedIframes()) {
+            unmountCardElements();
+          }
+          scheduleMount();
+          showError(
+            "The secure card fields are still loading. Please wait a moment and try again."
+          );
         }
-        scheduleMount();
+      } else {
+        // A mount/recovery is already in flight — just ask them to wait.
+        showError(
+          "The secure card fields are still loading. Please wait a moment and try again."
+        );
       }
-      showError(
-        "The secure card fields are still loading. Please wait a moment and try again."
-      );
       refreshCheckoutGate();
       return false;
     }
