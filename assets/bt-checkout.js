@@ -6,6 +6,49 @@
  * - cardNumber
  * - cardExpirationDate
  * - cardVerificationCode
+ *
+ * ---------------------------------------------------------------------------
+ * Field-initialization hardening (per Basis Theory support guidance).
+ *
+ * Symptom reported by merchants: the card fields appear on the checkout page
+ * but stay disabled — visible, but un-clickable, so the buyer cannot type a
+ * card and cannot complete checkout. It is intermittent (seen on iPhone Safari)
+ * and leaves no error on Basis Theory's side.
+ *
+ * Root cause (Basis Theory, John Ellis): each field is a cross-origin iframe
+ * that downloads its own code after the frame itself appears. The frame shows
+ * first; the script that makes it interactive arrives a moment later. If the
+ * checkout page removes, re-renders, re-mounts OR re-parents the field
+ * container while that script is still downloading, the browser CANCELS the
+ * download (Safari in particular reloads/cancels an iframe the instant it is
+ * moved in the DOM). The frame is left visible but dead — mounted yet never
+ * "ready".
+ *
+ * The guidance, implemented here point-for-point:
+ *   1. Mount each element ONCE and don't change its container afterwards —
+ *      watch for conditional rendering, framework re-renders and route changes.
+ *      => We no longer re-mount on every WooCommerce event / DOM mutation. We
+ *         wait for the DOM to SETTLE (go quiet) before mounting, so we never
+ *         mount into a container that is about to be replaced again, and we
+ *         never re-mount while fields are healthy.
+ *   2. If a field needs to be hidden, hide it with CSS rather than removing it.
+ *      => We never empty/remove a container that holds live iframes; switching
+ *         payment method relies on WooCommerce's CSS show/hide, which keeps the
+ *         iframes alive instead of destroying them.
+ *   3. Wait for each element's READY event before enabling checkout.
+ *      => We attach on('ready') to all three elements and only treat the fields
+ *         as usable (and only allow Place Order) once ALL THREE have fired. A
+ *         resolved mount() promise is NOT enough — the frame can be mounted but
+ *         not yet interactive, which is exactly this bug.
+ *   4. If ready doesn't arrive within a few seconds, unmount and mount again,
+ *      or show a reload option — so a buyer is never stuck.
+ *      => A ready-timeout triggers an automatic unmount+remount (bounded), and
+ *         if it still won't come up we surface a "reload the card fields"
+ *         control and keep Place Order disabled with a clear message.
+ *   5. Turn telemetry on when initializing the SDK so failures are visible to
+ *      Basis Theory.
+ *      => We initialize with disableTelemetry:false (see getBasisTheoryInstance).
+ * ---------------------------------------------------------------------------
  */
 
 (function ($) {
@@ -13,6 +56,9 @@
   let cardNumberElement = null;
   let cardExpirationDateElement = null;
   let cardVerificationCodeElement = null;
+  // "Ready" now means every element has fired its own `ready` event — i.e. the
+  // frames are not just mounted but interactive. A resolved mount() promise is
+  // deliberately NOT treated as ready (that gap is the disabled-fields bug).
   let isReady = false;
   let isTokenizing = false;
   let isMounting = false;
@@ -20,8 +66,60 @@
   // re-mount so a persistently failing mount can never spin in a tight loop.
   let lastMountAttemptAt = 0;
 
+  // Per-element ready tracking for the current mount attempt. Reset at the start
+  // of every mount; all three must fire before checkout is enabled (guidance #3).
+  const elementReady = { number: false, expiry: false, cvc: false };
+
+  // Per-element "has the buyer typed anything" tracking. Used so an automatic
+  // self-heal never silently wipes a card the shopper already entered into the
+  // field(s) that DID come up — in that case we offer a manual reload instead.
+  const fieldDirty = { number: false, expiry: false, cvc: false };
+
+  // Monotonic id for the current set of elements. Bumped on every (re)mount and
+  // teardown so a late `ready` event from a PREVIOUS, already-unmounted element
+  // (possible during a self-heal cycle) can't flip the new attempt to "ready",
+  // and so a superseded in-flight mount aborts cleanly when it resumes.
+  let mountGeneration = 0;
+
+  // Ready-timeout + bounded self-heal (guidance #4).
+  const READY_TIMEOUT_MS = 6000; // how long to wait for all three ready events
+  const MAX_HEAL_ATTEMPTS = 2; // auto unmount+remount this many times before we
+  //                              surface a manual reload control
+  let readyTimer = null;
+  let healAttempts = 0;
+  // One final, delayed auto-retry after the manual reload control is surfaced, so
+  // a transient failure can still self-recover on a static page where the buyer
+  // takes no action and no DOM mutation would otherwise re-trigger a mount. Used
+  // once per stuck episode (reset when the fields finally come up).
+  const EXHAUSTION_RETRY_MS = 15000;
+  let exhaustionRetryTimer = null;
+  let exhaustionRetryUsed = false;
+
   function showError(message) {
     $("#hsbt-card-error").text(message || "");
+  }
+
+  // Loading / reload affordances rendered by payment_fields() (guidance #4). All
+  // guarded with length checks so a theme that strips them never throws.
+  function showLoadingState() {
+    $("#hsbt-card-loading").show();
+    $("#hsbt-card-reload").hide();
+  }
+
+  function hideLoadingState() {
+    $("#hsbt-card-loading").hide();
+  }
+
+  function showReloadOption() {
+    $("#hsbt-card-loading").hide();
+    $("#hsbt-card-reload").show();
+    showError(
+      "The secure card fields could not finish loading. Please reload them to continue."
+    );
+  }
+
+  function hideReloadOption() {
+    $("#hsbt-card-reload").hide();
   }
 
   /**
@@ -135,36 +233,306 @@
     );
   }
 
+  function cardWrapperPresent() {
+    return (
+      $("#hsbt-card-number").length > 0 &&
+      $("#hsbt-card-expiry").length > 0 &&
+      $("#hsbt-card-cvc").length > 0
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Place Order gating (guidance #3: wait for ready before enabling checkout).
+  //
+  // While High Star is the selected method and the fields aren't ready, the
+  // Place Order button is disabled so a buyer can't submit into dead fields. We
+  // only touch the button when our gateway is selected so we never interfere
+  // with other payment methods. The hard guarantee lives in the submit handler
+  // below (it blocks the order until ready); this is the matching UX.
+  // ---------------------------------------------------------------------------
+  function refreshCheckoutGate() {
+    const $btn = $("#place_order");
+    if (!$btn.length) {
+      return;
+    }
+
+    if (isHighStarSelected() && !isReady) {
+      $btn.prop("disabled", true).addClass("hsbt-awaiting-fields");
+    } else {
+      // Only release the lock we placed; don't fight WooCommerce's own state.
+      if ($btn.hasClass("hsbt-awaiting-fields")) {
+        $btn.prop("disabled", false).removeClass("hsbt-awaiting-fields");
+      }
+    }
+  }
+
+  function clearReadyTimer() {
+    if (readyTimer) {
+      clearTimeout(readyTimer);
+      readyTimer = null;
+    }
+  }
+
+  // Live, per-element readiness — the authoritative gate. isReady is a cached
+  // latch of this; the submit path checks BOTH so a stale latch can't slip a
+  // tokenization through against a frame that isn't actually interactive.
+  function allElementsReady() {
+    return elementReady.number && elementReady.expiry && elementReady.cvc;
+  }
+
+  function anyFieldDirty() {
+    return fieldDirty.number || fieldDirty.expiry || fieldDirty.cvc;
+  }
+
+  function clearExhaustionRetryTimer() {
+    if (exhaustionRetryTimer) {
+      clearTimeout(exhaustionRetryTimer);
+      exhaustionRetryTimer = null;
+    }
+  }
+
+  // All three elements reported ready → the fields are genuinely interactive.
+  function onAllElementsReady() {
+    clearReadyTimer();
+    clearExhaustionRetryTimer();
+    isReady = true;
+    isMounting = false;
+    healAttempts = 0;
+    exhaustionRetryUsed = false;
+    hideLoadingState();
+    hideReloadOption();
+    showError("");
+    refreshCheckoutGate();
+  }
+
+  function markElementReady(key) {
+    elementReady[key] = true;
+    if (allElementsReady()) {
+      onAllElementsReady();
+    }
+  }
+
+  // Shared recovery for a mount that did NOT produce three interactive fields —
+  // whether because the ready events timed out OR because init/mount threw.
+  // Guidance #4: unmount+remount a bounded number of times, then fall back to a
+  // visible reload control so the buyer is never stuck. If the buyer has already
+  // typed into a field that came up, we DON'T silently wipe it with an automatic
+  // remount — we go straight to the manual reload option instead.
+  function recoverFromFailedMount() {
+    if (isReady) {
+      return; // raced with a late success — nothing to do
+    }
+
+    if (anyFieldDirty()) {
+      isMounting = false;
+      showReloadOption();
+      refreshCheckoutGate();
+      armExhaustionRetry();
+      return;
+    }
+
+    if (healAttempts < MAX_HEAL_ATTEMPTS) {
+      healAttempts += 1;
+      // Tear the half-loaded frames down cleanly before trying again so we don't
+      // stack iframes or leave a dead one in place.
+      unmountCardElements();
+      isMounting = false;
+      mountCardElements();
+      return;
+    }
+
+    // Out of automatic attempts — let the buyer trigger a fresh load themselves,
+    // and arm one last delayed retry as a safety net for a static, idle page.
+    isMounting = false;
+    showReloadOption();
+    refreshCheckoutGate();
+    armExhaustionRetry();
+  }
+
+  // One-shot delayed retry after the reload control is surfaced. Fires only if we
+  // are still stuck, nothing is being typed, and High Star is still selected —
+  // then grants a fresh heal budget for a single more automatic attempt.
+  function armExhaustionRetry() {
+    if (exhaustionRetryUsed || exhaustionRetryTimer) {
+      return;
+    }
+    exhaustionRetryTimer = setTimeout(function () {
+      exhaustionRetryTimer = null;
+      if (
+        isReady ||
+        isMounting ||
+        !isHighStarSelected() ||
+        anyFieldDirty()
+      ) {
+        return;
+      }
+      exhaustionRetryUsed = true;
+      healAttempts = 0;
+      unmountCardElements();
+      isMounting = false;
+      lastMountAttemptAt = 0;
+      scheduleMount();
+    }, EXHAUSTION_RETRY_MS);
+  }
+
+  // Ready events didn't all arrive in time → run the shared recovery.
+  function handleReadyTimeout() {
+    readyTimer = null;
+    recoverFromFailedMount();
+  }
+
+  function startReadyTimer() {
+    clearReadyTimer();
+    readyTimer = setTimeout(handleReadyTimeout, READY_TIMEOUT_MS);
+  }
+
+  // Tear down the current elements (used by the self-heal and before a rebuild).
+  // Prefers the SDK's own unmount() (clean teardown of the cross-origin frame);
+  // falls back to clearing the container if the method isn't available.
+  function unmountCardElements() {
+    const pairs = [
+      [cardNumberElement, "#hsbt-card-number"],
+      [cardExpirationDateElement, "#hsbt-card-expiry"],
+      [cardVerificationCodeElement, "#hsbt-card-cvc"],
+    ];
+
+    pairs.forEach(function (pair) {
+      const el = pair[0];
+      const selector = pair[1];
+      try {
+        if (el && typeof el.unmount === "function") {
+          el.unmount();
+        } else {
+          $(selector).empty();
+        }
+      } catch (e) {
+        $(selector).empty();
+      }
+    });
+
+    cardNumberElement = null;
+    cardExpirationDateElement = null;
+    cardVerificationCodeElement = null;
+    isReady = false;
+    elementReady.number = false;
+    elementReady.expiry = false;
+    elementReady.cvc = false;
+    fieldDirty.number = false;
+    fieldDirty.expiry = false;
+    fieldDirty.cvc = false;
+    // Invalidate any outstanding ready handlers from the torn-down elements.
+    mountGeneration += 1;
+  }
+
+  // The checkout DOM was replaced out from under us (WooCommerce AJAX refresh, a
+  // theme/Elementor re-render, or a mobile browser discarding the iframe): our
+  // element objects now point at frames that no longer exist. Drop them so the
+  // next mount rebuilds cleanly.
   function resetElementsIfCheckoutWasRefreshed() {
-    if (isReady && !hasMountedIframes()) {
-      bt = null;
+    if ((isReady || isMounting) && cardWrapperPresent() && !hasMountedIframes()) {
       cardNumberElement = null;
       cardExpirationDateElement = null;
       cardVerificationCodeElement = null;
       isReady = false;
       isMounting = false;
+      elementReady.number = false;
+      elementReady.expiry = false;
+      elementReady.cvc = false;
+      // Invalidate ready handlers bound to the now-destroyed elements.
+      mountGeneration += 1;
     }
   }
 
   async function getBasisTheoryInstance(publicKey, environment) {
     if (typeof window.basistheory === "function") {
-      return await window.basistheory(publicKey, { environment: environment });
+      return await window.basistheory(publicKey, {
+        environment: environment,
+        // Guidance #5: keep telemetry ON so Basis Theory receives the error and
+        // performance reports from checkout and can see initialization failures
+        // (like a cancelled frame load) directly. false is the SDK default; we
+        // set it explicitly so it can never be silently turned off.
+        disableTelemetry: false,
+      });
     }
 
     if (window.BasisTheory && typeof window.BasisTheory.init === "function") {
       return await window.BasisTheory.init(publicKey, {
         elements: true,
         environment: environment,
+        disableTelemetry: false,
       });
     }
 
     throw new Error("Basis Theory Elements failed to load.");
   }
 
+  // Attach the ready (and, for the card number, brand-change) listeners to an
+  // element. Listeners are wired before mount so we never miss an early ready.
+  // `generation` pins the handler to the mount attempt that created the element:
+  // a ready event from a superseded element (different generation) is ignored.
+  function wireElementEvents(element, key, generation) {
+    if (!element || typeof element.on !== "function") {
+      return;
+    }
+
+    element.on("ready", function () {
+      if (generation !== mountGeneration) {
+        return; // stale ready from a previous (unmounted) element — ignore
+      }
+      markElementReady(key);
+    });
+
+    element.on("change", function (event) {
+      // Remember (stickily) that the buyer has typed into this field, so a later
+      // self-heal won't silently wipe what they entered.
+      if (event && event.empty === false) {
+        fieldDirty[key] = true;
+      }
+
+      // Card number drives the CVC element's brand-specific length/validation.
+      if (
+        key === "number" &&
+        event &&
+        event.cardBrand &&
+        cardVerificationCodeElement &&
+        typeof cardVerificationCodeElement.update === "function"
+      ) {
+        cardVerificationCodeElement.update({
+          cardBrand: event.cardBrand,
+        });
+      }
+    });
+  }
+
+  // Best-effort teardown of a single element (used to drop a superseded mount's
+  // own frames without touching the current generation's state).
+  function safeUnmount(element, selector) {
+    try {
+      if (element && typeof element.unmount === "function") {
+        element.unmount();
+      } else if (selector) {
+        $(selector).empty();
+      }
+    } catch (e) {
+      if (selector) {
+        $(selector).empty();
+      }
+    }
+  }
+
   async function mountCardElements() {
+    // Capture the generation this attempt owns. Every `await` below yields to the
+    // event loop, during which a checkout re-render (updated_checkout) or a
+    // teardown can supersede us by bumping mountGeneration. We re-check after each
+    // await and bail out cleanly if superseded, so two mounts can never race and
+    // clobber each other's frames (guidance #1: mount once).
+    let generation = mountGeneration;
+
     try {
       resetElementsIfCheckoutWasRefreshed();
 
+      // Mount once (guidance #1): never rebuild while a mount is in flight or
+      // while the fields are already up and interactive.
       if (isMounting || isReady) {
         return;
       }
@@ -174,18 +542,47 @@
         return;
       }
 
-      if (
-        $("#hsbt-card-number").length === 0 ||
-        $("#hsbt-card-expiry").length === 0 ||
-        $("#hsbt-card-cvc").length === 0
-      ) {
+      if (!cardWrapperPresent()) {
+        return;
+      }
+
+      // Only mount when High Star is the active method (guidance #1/#2). Mounting
+      // into a payment box that WooCommerce has hidden with display:none is a
+      // known trigger for "mounted but never ready" on iOS Safari (hidden/offscreen
+      // iframes get deprioritized), and would burn the self-heal budget for a
+      // method the buyer isn't even using. payment_method_selected mounts us when
+      // the buyer switches to High Star and the box becomes visible.
+      if (!isHighStarSelected()) {
         return;
       }
 
       isMounting = true;
       lastMountAttemptAt = Date.now();
       showError("");
+      hideReloadOption();
+      showLoadingState();
+      refreshCheckoutGate();
 
+      // Reset per-element ready/dirty tracking for this attempt and advance the
+      // generation so any late event from the previous elements is ignored.
+      mountGeneration += 1;
+      generation = mountGeneration;
+      elementReady.number = false;
+      elementReady.expiry = false;
+      elementReady.cvc = false;
+      fieldDirty.number = false;
+      fieldDirty.expiry = false;
+      fieldDirty.cvc = false;
+      isReady = false;
+
+      // Arm the watchdog BEFORE initializing the SDK (guidance #4). It covers the
+      // whole attempt — init, create AND mount+ready — so even if SDK init hangs
+      // or never settles, recovery still runs instead of stranding isMounting=true.
+      startReadyTimer();
+
+      // We're about to (re)create the frames, so clear whatever is in the
+      // containers first. This is the ONLY place a container is emptied, and only
+      // right before we immediately mount fresh frames into it.
       $("#hsbt-card-number").empty();
       $("#hsbt-card-expiry").empty();
       $("#hsbt-card-cvc").empty();
@@ -194,6 +591,12 @@
         hsbtData.publicKey,
         hsbtData.environment || "us"
       );
+
+      // Superseded during SDK init — a newer attempt owns the state and timer now.
+      // Nothing was created yet, so just stand down.
+      if (generation !== mountGeneration) {
+        return;
+      }
 
       const baseStyle = {
         color: "#222",
@@ -204,7 +607,7 @@
         },
       };
 
-      cardNumberElement = bt.createElement("cardNumber", {
+      const numberEl = bt.createElement("cardNumber", {
         targetId: "hsbt-card-number-input",
         placeholder: "Card number",
         autoComplete: "cc-number",
@@ -216,7 +619,7 @@
         },
       });
 
-      cardExpirationDateElement = bt.createElement("cardExpirationDate", {
+      const expiryEl = bt.createElement("cardExpirationDate", {
         targetId: "hsbt-card-expiry-input",
         placeholder: "MM / YY",
         autoComplete: "cc-exp",
@@ -228,7 +631,7 @@
         },
       });
 
-      cardVerificationCodeElement = bt.createElement("cardVerificationCode", {
+      const cvcEl = bt.createElement("cardVerificationCode", {
         targetId: "hsbt-card-cvc-input",
         placeholder: "CVC",
         autoComplete: "cc-csc",
@@ -240,39 +643,55 @@
         },
       });
 
+      cardNumberElement = numberEl;
+      cardExpirationDateElement = expiryEl;
+      cardVerificationCodeElement = cvcEl;
+
+      // Wire ready/brand listeners BEFORE mounting so no early ready is missed.
+      wireElementEvents(numberEl, "number", generation);
+      wireElementEvents(expiryEl, "expiry", generation);
+      wireElementEvents(cvcEl, "cvc", generation);
+
       await Promise.all([
-        cardNumberElement.mount("#hsbt-card-number"),
-        cardExpirationDateElement.mount("#hsbt-card-expiry"),
-        cardVerificationCodeElement.mount("#hsbt-card-cvc"),
+        numberEl.mount("#hsbt-card-number"),
+        expiryEl.mount("#hsbt-card-expiry"),
+        cvcEl.mount("#hsbt-card-cvc"),
       ]);
 
-      if (typeof cardNumberElement.on === "function") {
-        cardNumberElement.on("change", function (event) {
-          if (
-            event &&
-            event.cardBrand &&
-            cardVerificationCodeElement &&
-            typeof cardVerificationCodeElement.update === "function"
-          ) {
-            cardVerificationCodeElement.update({
-              cardBrand: event.cardBrand,
-            });
-          }
-        });
+      // Superseded while mounting — our frames are orphans (a newer attempt may
+      // already own the containers). Tear down OUR OWN elements via the locals and
+      // leave all shared state/timers to the current generation.
+      if (generation !== mountGeneration) {
+        safeUnmount(numberEl, "#hsbt-card-number");
+        safeUnmount(expiryEl, "#hsbt-card-expiry");
+        safeUnmount(cvcEl, "#hsbt-card-cvc");
+        return;
       }
 
-      isReady = true;
-      isMounting = false;
-      showError("");
+      // NOTE: we intentionally do NOT set isReady here. The frames are now
+      // mounted, but "mounted" is not "ready" — the interactive code may still be
+      // downloading. isReady flips only when all three `ready` events fire (see
+      // onAllElementsReady), which is the whole point of this fix.
     } catch (error) {
-      isReady = false;
-      isMounting = false;
       console.error("Basis Theory init/mount error:", error);
+
+      // A newer attempt already took over — let it handle recovery.
+      if (generation !== mountGeneration) {
+        return;
+      }
+
+      clearReadyTimer();
+      isReady = false;
+      hideLoadingState();
       showError(
         error && error.message
           ? error.message
           : "Could not initialize card fields."
       );
+      // Treat a mount/init failure exactly like a ready-timeout: self-heal a
+      // bounded number of times, then surface the reload control (guidance #4) —
+      // so the buyer always has a path forward instead of a dead-end error.
+      recoverFromFailedMount();
     }
   }
 
@@ -349,67 +768,80 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Self-healing re-mount (root-cause fix for "fields disappear on scroll /
-  // checkout update").
+  // Mount scheduling (guidance #1: mount once, don't thrash the container).
   //
-  // The card fields are cross-origin iframes mounted into the #hsbt-card-* divs.
-  // Anything that replaces or re-renders that DOM destroys the iframes and blanks
-  // the fields: WooCommerce's checkout AJAX refresh (update_checkout) swaps the
-  // payment markup for fresh empty divs; an Elementor/theme re-render or iframe
-  // lazy-loader can rebuild the section; some mobile browsers discard off-screen
-  // iframes on scroll. Only the WooCommerce case fires `updated_checkout`, so the
-  // theme/scroll cases would otherwise leave the fields blank until a page reload.
+  // WooCommerce's checkout AJAX (update_checkout) replaces the payment markup
+  // with fresh empty containers, which unavoidably destroys the iframes — a
+  // gateway plugin can't stop that. What we CAN control is WHEN we mount into
+  // the new containers. If we mount immediately and WooCommerce (or a theme)
+  // fires another re-render a moment later while the frame code is still
+  // downloading, that download is cancelled and the field is left dead — the
+  // exact failure Basis Theory described.
   //
-  // A MutationObserver watches the checkout DOM and re-mounts whenever the
-  // container is present but its iframes have vanished — so the fields reappear
-  // on their own, no matter what removed them. It never runs while a mount is in
-  // progress, is throttled against a failing-mount loop, and no-ops once the
-  // iframes are present, so it can't double-mount or spin.
+  // So instead of re-mounting on every event, we debounce: each trigger pushes
+  // the mount back, and we only mount once the DOM has been QUIET for a short
+  // settle window. That guarantees we never mount into a container that is about
+  // to be replaced again.
   // ---------------------------------------------------------------------------
-
-  const REMOUNT_COOLDOWN_MS = 1200;
-  let remountCheckTimer = null;
+  const MOUNT_SETTLE_MS = 450;
+  const REMOUNT_COOLDOWN_MS = 1500;
+  let mountSettleTimer = null;
   let observerStarted = false;
 
-  function cardWrapperPresent() {
-    return (
-      $("#hsbt-card-number").length > 0 &&
-      $("#hsbt-card-expiry").length > 0 &&
-      $("#hsbt-card-cvc").length > 0
-    );
-  }
-
-  function remountIfFieldsMissing() {
-    // A mount already in progress will finish and populate the iframes itself.
+  function scheduleMount() {
+    // A mount is already in flight — never arm a second one (guidance #1: mount
+    // once). Callers that genuinely need to supersede an in-flight mount first
+    // clear it via resetElementsIfCheckoutWasRefreshed(), which runs before they
+    // call scheduleMount().
     if (isMounting) {
       return;
     }
-    // Gateway markup isn't on the page (e.g. a different payment method) — skip.
-    if (!cardWrapperPresent()) {
+    // Fields are already up and interactive — don't disturb them (guidance #1).
+    if (isReady && hasMountedIframes()) {
       return;
     }
-    // Iframes are still mounted — the fields are fine.
-    if (hasMountedIframes()) {
-      return;
+    // Reset the settle timer on every trigger so we mount only after the DOM has
+    // gone quiet (no further re-renders for MOUNT_SETTLE_MS).
+    if (mountSettleTimer) {
+      clearTimeout(mountSettleTimer);
     }
-    // Throttle: if a mount was just attempted, don't immediately try again (this
-    // also breaks any showError → mutation → re-mount feedback loop on failure).
-    if (Date.now() - lastMountAttemptAt < REMOUNT_COOLDOWN_MS) {
-      return;
-    }
-    // Container present but its iframes are gone → rebuild them.
-    mountCardElements();
+    mountSettleTimer = setTimeout(function () {
+      mountSettleTimer = null;
+      mountCardElements();
+    }, MOUNT_SETTLE_MS);
   }
 
-  function scheduleRemountCheck() {
-    // Debounce: DOM re-renders arrive in bursts; coalesce them into one check.
-    if (remountCheckTimer) {
+  // Observer-driven recovery for re-renders that DON'T fire a WooCommerce event
+  // (theme/Elementor rebuilds, a mobile browser discarding an off-screen frame).
+  // It only acts when our container is present but its iframes have vanished, is
+  // throttled against a failing-mount loop, and no-ops once the frames are back —
+  // so it can't spin or fight a healthy mount.
+  function remountIfFieldsMissing() {
+    if (isMounting) {
+      return; // a mount is finishing; it will populate the frames itself
+    }
+    if (!cardWrapperPresent()) {
+      return; // gateway markup isn't on the page (different method / not checkout)
+    }
+    if (hasMountedIframes()) {
+      return; // frames are present — nothing to recover
+    }
+    if (Date.now() - lastMountAttemptAt < REMOUNT_COOLDOWN_MS) {
+      return; // just attempted; let the settle/ready-timeout logic run its course
+    }
+    scheduleMount();
+  }
+
+  let observerCheckTimer = null;
+  function scheduleObserverCheck() {
+    // Debounce: DOM mutations arrive in bursts; coalesce them into one check.
+    if (observerCheckTimer) {
       return;
     }
-    remountCheckTimer = setTimeout(function () {
-      remountCheckTimer = null;
+    observerCheckTimer = setTimeout(function () {
+      observerCheckTimer = null;
       remountIfFieldsMissing();
-    }, 200);
+    }, 250);
   }
 
   function startCheckoutObserver() {
@@ -418,14 +850,53 @@
     }
     // Watch the whole document body so a full-section re-render by the theme /
     // Elementor is caught too (not just WooCommerce's in-form fragment swap).
-    // The callback is a cheap no-op unless our iframes have actually vanished.
-    const observer = new MutationObserver(scheduleRemountCheck);
+    // The callback is a cheap no-op unless our iframes have actually vanished,
+    // so unrelated page mutations cost next to nothing and never trigger a mount.
+    const observer = new MutationObserver(scheduleObserverCheck);
     observer.observe(document.body, { childList: true, subtree: true });
     observerStarted = true;
   }
 
-  $(document.body).on("updated_checkout payment_method_selected", function () {
-    setTimeout(mountCardElements, 500);
+  // WooCommerce replaced the payment markup (address/shipping/coupon change) —
+  // the containers are fresh and empty, so (re)mount after the DOM settles. We
+  // also re-apply the Place Order gate because WooCommerce rebuilds the button
+  // in an enabled state on every update.
+  $(document.body).on("updated_checkout", function () {
+    // The payment markup was just replaced, so our iframes are already gone even
+    // though isReady may still read true from the previous render. Drop that
+    // stale state FIRST so the Place Order gate immediately reflects "fields not
+    // ready" and can't briefly allow a submit into dead frames.
+    resetElementsIfCheckoutWasRefreshed();
+    refreshCheckoutGate();
+    scheduleMount();
+  });
+
+  // Switching the selected payment method does NOT destroy our iframes —
+  // WooCommerce hides the unselected payment boxes with CSS and shows them again
+  // on reselect (guidance #2: hide, don't remove). So healthy, already-interactive
+  // fields are left completely alone.
+  $(document.body).on("payment_method_selected", function () {
+    refreshCheckoutGate();
+
+    if (!isHighStarSelected()) {
+      return; // another method is active — nothing for us to do
+    }
+
+    // Already up and interactive — leave it be (guidance #1: don't re-mount).
+    if (isReady && hasMountedIframes()) {
+      return;
+    }
+
+    // The buyer just switched TO High Star and its box is now visible. Give a
+    // fresh self-heal budget and (re)build. If a dead frame had been pre-mounted
+    // while the box was hidden, drop it first so we rebuild in the visible box.
+    healAttempts = 0;
+    exhaustionRetryUsed = false;
+    clearExhaustionRetryTimer();
+    if (!isMounting && hasMountedIframes() && !isReady) {
+      unmountCardElements();
+    }
+    scheduleMount();
   });
 
   // Any failed checkout (card decline, backend/technical error, lost response)
@@ -437,14 +908,79 @@
     clearTokenIntentForRetry();
   });
 
+  // Manual reload control (guidance #4): a buyer whose fields never came up can
+  // force a fresh load without refreshing the whole page (which would lose the
+  // address they already typed). Resets the self-heal budget and rebuilds.
+  $(document).on("click", "#hsbt-card-reload-btn", function (e) {
+    e.preventDefault();
+    hideReloadOption();
+    showError("");
+    healAttempts = 0;
+    exhaustionRetryUsed = false;
+    clearExhaustionRetryTimer();
+    unmountCardElements();
+    isMounting = false;
+    lastMountAttemptAt = 0; // allow an immediate rebuild
+    scheduleMount();
+  });
+
+  // Back/forward-cache restore (common on mobile Safari when the buyer navigates
+  // back to checkout): cross-origin card frames are very likely stale because the
+  // browser reloads iframes on restore. Don't trust latched readiness — tear the
+  // old frames down and rebuild so the buyer never lands on visible-but-dead
+  // fields (guidance #1/#3).
+  $(window).on("pageshow", function (e) {
+    const original = e && e.originalEvent;
+    if (!original || !original.persisted) {
+      return;
+    }
+    unmountCardElements();
+    isMounting = false;
+    healAttempts = 0;
+    exhaustionRetryUsed = false;
+    clearExhaustionRetryTimer();
+    lastMountAttemptAt = 0;
+    refreshCheckoutGate();
+    scheduleMount();
+  });
+
   $(document).ready(function () {
-    setTimeout(mountCardElements, 500);
+    scheduleMount();
     startCheckoutObserver();
+    refreshCheckoutGate();
   });
 
   $("form.checkout").on("checkout_place_order_hsbt_gateway", function () {
     if (!isHighStarSelected()) {
       return true;
+    }
+
+    // If the checkout DOM was swapped since the fields last became ready, our
+    // iframes are gone but isReady can still read true — re-sync before gating so
+    // we never tokenize against destroyed frames.
+    resetElementsIfCheckoutWasRefreshed();
+
+    // Guidance #3: never let a buyer submit into fields that aren't interactive
+    // yet. We require the cached latch AND live per-element readiness AND present
+    // iframes, so a stale latch (e.g. after a bfcache restore) can't slip a
+    // tokenization through against a frame that isn't actually interactive.
+    const fieldsUsable = isReady && allElementsReady() && hasMountedIframes();
+    if (!fieldsUsable) {
+      // Make sure a recovery is actually in flight. If nothing is pending (e.g. a
+      // prior attempt already gave up and surfaced the reload control), clicking
+      // Place Order itself kicks off a fresh mount instead of only showing text.
+      if (!isMounting && !readyTimer) {
+        healAttempts = 0;
+        if (hasMountedIframes()) {
+          unmountCardElements();
+        }
+        scheduleMount();
+      }
+      showError(
+        "The secure card fields are still loading. Please wait a moment and try again."
+      );
+      refreshCheckoutGate();
+      return false;
     }
 
     if ($("#hsbt_token_intent_id").val()) {

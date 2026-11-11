@@ -2,7 +2,7 @@
 /**
  * Plugin Name: High Star Payment Gateway
  * Description: WooCommerce custom payment gateway using Secure payment gateway configuration.
- * Version: 0.3.6
+ * Version: 0.3.7
  * Author: High Star Payments
  * Requires at least: 6.0
  * Requires PHP: 8.2
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
  * Plugin constants. Each guarded with defined() so a double-load cannot fatal.
  */
 if (!defined('HSBT_VERSION')) {
-    define('HSBT_VERSION', '0.3.6');
+    define('HSBT_VERSION', '0.3.7');
 }
 if (!defined('HSBT_PLUGIN_FILE')) {
     define('HSBT_PLUGIN_FILE', __FILE__);
@@ -182,6 +182,22 @@ function hsbt_init_gateway() {
             echo '    <div id="hsbt-card-expiry" style="width:50%;min-height:44px;padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;"></div>';
             echo '    <div id="hsbt-card-cvc" style="width:50%;min-height:44px;padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;"></div>';
             echo '  </div>';
+            echo '</div>';
+
+            // Shown by bt-checkout.js until every card field fires its `ready`
+            // event (i.e. the hosted iframes are not just visible but actually
+            // interactive). Hidden the moment the fields are usable. This is what
+            // keeps a buyer from typing into — or submitting through — a field
+            // that looks present but hasn't finished loading.
+            echo '<div id="hsbt-card-loading" style="display:none;margin-top:8px;font-size:13px;color:#666;">Loading secure card fields&hellip;</div>';
+
+            // Fallback reload control. If the card fields never become interactive
+            // within a few seconds (the hosted iframe code was cancelled mid-load),
+            // bt-checkout.js first retries automatically and, if that still fails,
+            // reveals this so the buyer is never stuck with dead fields. Reloading
+            // only the fields preserves the address/details already entered.
+            echo '<div id="hsbt-card-reload" style="display:none;margin-top:8px;font-size:13px;">';
+            echo '  <button type="button" id="hsbt-card-reload-btn" class="button">Reload payment fields</button>';
             echo '</div>';
 
             echo '<input type="hidden" name="hsbt_token_intent_id" id="hsbt_token_intent_id" value="">';

@@ -5,7 +5,7 @@ Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.2
 WC requires at least: 7.0
-Stable tag: 0.3.6
+Stable tag: 0.3.7
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -44,6 +44,13 @@ token is only needed for a private repository, and it would ship to every store
 in plain text - which is why it is left empty by default.
 
 == Changelog ==
+
+= 0.3.7 =
+* Fixed disabled checkout card fields, especially on mobile Safari.
+* Improved field loading, readiness checks, and automatic recovery.
+* Added a manual "Reload payment fields" option.
+* Kept SDK telemetry enabled for troubleshooting.
+* No changes to tokenization, idempotency, VIP/recurring, or backend payload.
 
 = 0.3.6 =
 * Maintenance release: PHP 8.x compatibility checks and internal testing. Updated
